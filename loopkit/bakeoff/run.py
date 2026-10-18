@@ -24,6 +24,7 @@ held-out seeds are never used before the bake-off.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import sys
@@ -59,6 +60,20 @@ class Tee:
         if self.path is not None:
             with open(self.path, "a", encoding="utf-8", newline="\n") as f:
                 f.write(f"[{stamp}] {line}\n")
+
+
+@contextlib.contextmanager
+def keep_awake():
+    """Ask Windows not to sleep while the run is going (the display may still turn off). No-op elsewhere."""
+    kernel32 = getattr(getattr(__import__("ctypes"), "windll", None), "kernel32", None)
+    es_continuous, es_system_required = 0x80000000, 0x00000001
+    if kernel32 is not None:
+        kernel32.SetThreadExecutionState(es_continuous | es_system_required)
+    try:
+        yield
+    finally:
+        if kernel32 is not None:
+            kernel32.SetThreadExecutionState(es_continuous)
 
 
 def _read_unit(path: Path) -> dict:
@@ -308,37 +323,8 @@ def main(argv: list[str] | None = None) -> int:
         ctx_fake = fake_script(reference_writer)
         ctx_fake.__enter__()
     try:
-        for model in models:
-            for task in tasks:
-                for k in range(1, repeats + 1):
-                    unit = unit_name(model, task, k)
-                    path = out / "units" / f"{unit}.json"
-                    prior = _read_unit(path)
-                    if prior.get("status") in FINISHED:
-                        log(f"skip {unit} ({prior['status']})")
-                        if prior["status"] == "budget_stop":
-                            stopped_models.setdefault(model, unit)
-                        continue
-                    if model in no_key:
-                        rec = {"unit": unit, "model": model, "task": task, "repeat": k, "status": "skipped_no_key",
-                               "reason": no_key[model], "dry_run": args.dry_run}
-                        path.write_text(json.dumps(rec, indent=1), encoding="utf-8")
-                        continue
-                    if model in stopped_models:
-                        rec = {"unit": unit, "model": model, "task": task, "repeat": k, "status": "skipped_after_budget_stop",
-                               "stopped_at": stopped_models[model], "dry_run": args.dry_run}
-                        path.write_text(json.dumps(rec, indent=1), encoding="utf-8")
-                        log(f"skip {unit}: {model} stopped at its cap in {stopped_models[model]}")
-                        continue
-                    check_disk_floor()
-                    log(f"run {unit}")
-                    rec = run_unit(out, model, task, k, cfg, dry=args.dry_run, workers=args.workers, log=log,
-                                   train_override=train, heldout_override=heldout)
-                    path.write_text(json.dumps(rec, indent=1, default=str), encoding="utf-8")
-                    log(f"done {unit}: status {rec['status']}, held-out pass rate {rec.get('heldout_pass_rate')}, "
-                        f"{rec['wall_seconds']} s")
-                    if rec["status"] == "budget_stop":
-                        stopped_models[model] = unit
+        with keep_awake():
+            _run_units(out, models, tasks, repeats, cfg, args, log, train, heldout, no_key, stopped_models)
     finally:
         if ctx_fake is not None:
             ctx_fake.__exit__(None, None, None)
@@ -348,6 +334,42 @@ def main(argv: list[str] | None = None) -> int:
         paths = build_report(out)
         log(f"report: {paths}")
     return 0
+
+
+def _run_units(out: Path, models: list[str], tasks: list[str], repeats: int, cfg: BakeoffConfig, args, log: Tee,
+               train: list[int] | None, heldout: list[int] | None, no_key: dict[str, str],
+               stopped_models: dict[str, str]) -> None:
+    for model in models:
+        for task in tasks:
+            for k in range(1, repeats + 1):
+                unit = unit_name(model, task, k)
+                path = out / "units" / f"{unit}.json"
+                prior = _read_unit(path)
+                if prior.get("status") in FINISHED:
+                    log(f"skip {unit} ({prior['status']})")
+                    if prior["status"] == "budget_stop":
+                        stopped_models.setdefault(model, unit)
+                    continue
+                if model in no_key:
+                    rec = {"unit": unit, "model": model, "task": task, "repeat": k, "status": "skipped_no_key",
+                           "reason": no_key[model], "dry_run": args.dry_run}
+                    path.write_text(json.dumps(rec, indent=1), encoding="utf-8")
+                    continue
+                if model in stopped_models:
+                    rec = {"unit": unit, "model": model, "task": task, "repeat": k, "status": "skipped_after_budget_stop",
+                           "stopped_at": stopped_models[model], "dry_run": args.dry_run}
+                    path.write_text(json.dumps(rec, indent=1), encoding="utf-8")
+                    log(f"skip {unit}: {model} stopped at its cap in {stopped_models[model]}")
+                    continue
+                check_disk_floor()
+                log(f"run {unit}")
+                rec = run_unit(out, model, task, k, cfg, dry=args.dry_run, workers=args.workers, log=log,
+                               train_override=train, heldout_override=heldout)
+                path.write_text(json.dumps(rec, indent=1, default=str), encoding="utf-8")
+                log(f"done {unit}: status {rec['status']}, held-out pass rate {rec.get('heldout_pass_rate')}, "
+                    f"{rec['wall_seconds']} s")
+                if rec["status"] == "budget_stop":
+                    stopped_models[model] = unit
 
 
 if __name__ == "__main__":
