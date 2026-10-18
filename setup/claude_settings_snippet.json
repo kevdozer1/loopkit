@@ -1,0 +1,13 @@
+{
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "Organization: personal robotics research by Kevin Hopkins. Primary use: software development and simulation experiments",
+      "Trusted internal domains: api.anthropic.com, api.openai.com, generativelanguage.googleapis.com, openrouter.ai, platform.elorian.ai, api.typesafe.ai, pypi.org, files.pythonhosted.org, github.com, huggingface.co",
+      "Additional context: loopkit sends simulator and robot camera images to model APIs by design. No secrets or personal data are sent."
+    ]
+  },
+  "permissions": {
+    "deny": ["Bash(git push *)"]
+  }
+}

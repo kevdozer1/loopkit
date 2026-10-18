@@ -1,0 +1,31 @@
+# Bake-off config. See docs/03_bakeoff_protocol.md.
+
+name: rack_cell_v1
+models: [opus, astra, sol, argon, glimpse, cheap_open]
+optional_models: [luna]          # include only if total projected cost stays under total_cap_usd
+tasks: [T1, T2, T3]
+repeats: 3
+train_seeds: {start: 1000, count: 10}
+heldout_seeds: {start: 2000, count: 20}   # never used before the bake-off
+patch:
+  max_rounds: 5
+  stop_after_no_improvement: 2
+writer:
+  reasoning: highest               # record the setting actually sent per model
+  max_tokens: 16000
+reader:
+  reasoning: disabled
+  max_tokens: 1500
+caps_usd:                          # per model, all tasks and repeats together
+  opus: 8
+  astra: 15
+  sol: 5
+  argon: 8
+  glimpse: 3
+  cheap_open: 2
+  luna: 1
+total_cap_usd: 50
+cache:
+  include_repeat_in_hash: true     # repeats must not share cache hits
+checkpoint_every_unit: true
+output_dir: bakeoff                # under LOOPKIT_DATA, then a date folder

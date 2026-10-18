@@ -1,0 +1,140 @@
+# loopkit model table. Prices in USD per million tokens.
+#
+# verified: true means the id and price were read from a live catalogue (source and date given).
+# verified: false means S1 must confirm the id and price against the provider's live catalogue
+# (OpenRouter: https://openrouter.ai/api/v1/models) before any paid call, then set verified: true
+# and update source and accessed. If a price stays unknown, the router projects cost at Astra prices.
+#
+# Image input tokens are priced at price_in unless a provider lists a separate image price.
+
+version: "2026-10-17"
+currency: USD
+unit: usd_per_million_tokens
+
+models:
+  opus:
+    display: Claude Opus 5.5
+    adapter: openrouter
+    id: anthropic/claude-opus-5.5
+    direct: {adapter: anthropic, id: claude-opus-5-5}
+    price_in: 4.00
+    price_out: 20.00
+    vision: true
+    roles: [writer, reader]
+    verified: true
+    source: robolabel prices.yaml, OpenRouter catalogue
+    accessed: "2026-09-27"
+
+  astra:
+    display: GPT-6 Astra
+    adapter: openrouter
+    id: openai/gpt-6-astra
+    price_in: 10.00
+    price_out: 50.00
+    vision: true
+    roles: [writer, reader]
+    verified: true
+    source: robolabel prices.yaml, OpenRouter catalogue
+    accessed: "2026-09-27"
+
+  sol:
+    display: GPT-6.1 Sol
+    adapter: openrouter
+    id: openai/gpt-6.1-sol
+    fallback_id: openai/gpt-6-sol   # verified at 2.00 / 10.00 on 2026-09-27
+    price_in: 2.00
+    price_out: 10.00
+    vision: true
+    roles: [writer, reader]
+    verified: false
+    source: GPT-6 Sol price from robolabel. Confirm the 6.1 id and price. Elorian's launch post puts Glimpse 70% below Sol, which fits 2.00 / 10.00
+    accessed: null
+
+  argon:
+    display: Gemini 4 Argon
+    adapter: openrouter
+    id: google/gemini-4-argon
+    direct: {adapter: gemini, id: null}
+    price_in: null
+    price_out: null
+    vision: true
+    roles: [writer, reader]
+    verified: false
+    source: id is a guess. Look it up
+    accessed: null
+
+  glimpse:
+    display: Elorian Glimpse
+    adapter: elorian
+    id: null              # read from platform.elorian.ai docs
+    base_url: null        # if the API is OpenAI-compatible, reuse the OpenAI-style adapter with this base_url
+    env_key: ELORIAN_API_KEY
+    price_in: 0.60
+    price_out: 3.00
+    vision: true
+    roles: [reader, writer]
+    verified: false
+    source: Elorian launch post (https://elorian.ai/blog/introducing-glimpse) and FourWeekMBA coverage, Oct 16 2026
+    accessed: "2026-10-17"
+
+  cheap_open:
+    display: cheapest open-weights vision model on OpenRouter
+    adapter: openrouter
+    id: null              # S1 picks it: open weights, accepts images, supports JSON output. Record why
+    price_in: null
+    price_out: null
+    vision: true
+    roles: [writer, reader]
+    verified: false
+    source: null
+    accessed: null
+
+  luna:
+    display: GPT-6 Luna (optional cheap closed baseline)
+    adapter: openrouter
+    id: openai/gpt-6-luna
+    price_in: 0.10
+    price_out: 0.50
+    vision: true
+    roles: [reader, writer]
+    verified: true
+    source: robolabel prices.yaml, OpenRouter catalogue
+    accessed: "2026-09-27"
+
+  d1:
+    display: Liquid d1
+    adapter: openrouter
+    id: null              # find the Liquid d1 id on OpenRouter. Text only there
+    price_in: 0.04
+    price_out: null
+    vision: false
+    roles: [system1]
+    verified: false
+    source: Liquid AI blog (https://www.liquid.ai/blog/d1-decision-model), Oct 5 2026
+    accessed: "2026-10-16"
+
+  jev:
+    display: Typesafe Jev
+    adapter: jev
+    id: jev-latest
+    endpoint: https://api.typesafe.ai/v1/systemone
+    env_key: TYPESAFE_JEV_API_KEY
+    price_in: 0.042
+    price_out: 0.0
+    vision: false
+    roles: [system1]
+    verified: true
+    source: robolabel prices.yaml (docs.typesafe.ai). The API returns no cost field, so compute from input tokens
+    accessed: "2026-09-26"
+
+  fake:
+    display: FakeModel for tests and dry runs
+    adapter: fake
+    id: fake
+    price_in: 0.0
+    price_out: 0.0
+    vision: true
+    roles: [writer, reader, system1]
+    verified: true
+    source: offline
+    accessed: null
