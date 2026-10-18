@@ -16,6 +16,12 @@ TraceWriter for the same run, in another process or in this one, raises
 RunLockedError naming the run. Within a process, a writer is safe to share
 between threads.
 
+A Ctrl+C while a writer opens or closes never leaves the run locked with no
+writer to close. An open that it interrupts gives back everything it took, and a
+Ctrl+C that lands inside close() still releases the run. ``closed`` turns True
+only once the run is released: if it is still False after a KeyboardInterrupt,
+close() never got started, and calling it again finishes the job.
+
 Opening a run that already has events resumes it. A partial last line left by a
 crash stays where it is (readers skip it) and the next event starts on a fresh
 line, so nothing written earlier is rewritten or lost. Each event's seq is
@@ -182,32 +188,25 @@ def parse_event_line(line: bytes | str) -> TraceEvent:
     return event
 
 
-def _line_seq(line: bytes) -> int | None:
-    """The seq a reader would give ``line``, or None when no reader accepts it.
-
-    Lines in the writer's own form (a plain int seq) need only json.loads. Any other
-    line (seq written as 1.0 or "2", a surrogate escape) goes through
-    parse_event_line, so resume and the readers agree on every seq. A line can
-    fail in any way here, RecursionError included.
-    """
+def _plain_seq(line: bytes) -> int | None:
+    """The seq of ``line`` when it is written in the writer's own form (a plain int in
+    range), whether or not a reader accepts the rest of the line; else None."""
     try:
         obj = json.loads(line)
-    except Exception:
-        obj = None
-    seq = obj.get("seq") if isinstance(obj, dict) else None
-    if type(seq) is int and 0 <= seq <= MAX_SEQ:
-        return seq
-    try:
-        return parse_event_line(line).seq
-    except Exception:
+    except Exception:  # any failure, RecursionError included
         return None
+    seq = obj.get("seq") if isinstance(obj, dict) else None
+    return seq if type(seq) is int and 0 <= seq <= MAX_SEQ else None
 
 
 def _scan_events(path: Path) -> tuple[int, int, bool]:
-    """(next seq, unparsable lines, needs a newline before appending) for an events file.
+    """(next seq, malformed lines, needs a newline before appending) for an events file.
 
-    The next seq is one past the highest seq on any line a reader accepts, so a
-    seq is never handed out twice.
+    Each line goes through parse_event_line, the rule read_events applies, so the
+    malformed count is the one read_events reports and resume agrees with the
+    readers on every seq (1.0, "2", a surrogate escape). The next seq is one past
+    the highest seq on any line: every seq a reader accepts, plus the plain int seq
+    of a line it rejects, so a seq is never handed out twice.
     """
     try:
         data = path.read_bytes()
@@ -215,11 +214,14 @@ def _scan_events(path: Path) -> tuple[int, int, bool]:
         return 0, 0, False
     top, bad = -1, 0
     for _, line in iter_lines(data):
-        seq = _line_seq(line)
-        if seq is None:
+        try:
+            seq = parse_event_line(line).seq
+        except Exception:  # any failure on one line, RecursionError included, costs that line only
             bad += 1
-        else:
-            top = max(top, seq)
+            seq = _plain_seq(line)
+            if seq is None:
+                continue
+        top = max(top, seq)
     return top + 1, bad, bool(data) and not data.endswith(b"\n")
 
 
@@ -326,6 +328,10 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 # ------------------------------------------------------------------------ the run lock
+# Ctrl+C reaches Python code right after a C call returns or as a Python function
+# starts, so it can land between any two steps of taking or giving back a run. Each
+# step below leaves a state that _RunLock.release() undoes, and a release() that Ctrl+C
+# cut short is finished by calling it again.
 _OPEN_RUNS: dict[str, "_RunLock"] = {}
 # Re-entrant: release() also runs from a finalizer or a signal handler, possibly on
 # the thread that holds this lock.
@@ -333,45 +339,107 @@ _OPEN_RUNS_LOCK = threading.RLock()
 
 
 class _RunLock:
-    """This process's claim on one run: its registry entry plus the OS lock on ``.writer.lock``."""
+    """This process's claim on one run: its registry entry plus the OS lock on ``.writer.lock``.
+
+    Built holding nothing, so its owner has it in hand before acquire() takes anything;
+    release() gives back whatever part of the claim is still held.
+    """
 
     def __init__(self, run_dir: Path, run_id: str):
         self.key = os.path.normcase(str(run_dir))
+        self.run_dir = run_dir
         self.path = run_dir / LOCK_FILE
-        self._fd: int | None = None
+        self.run_id = run_id
+        self._fh: io.FileIO | None = None  # the open lock file: closing it drops the OS lock
+        self._releasing = False  # a release() is under way in this thread (see release)
+
+    @property
+    def held(self) -> bool:
+        """True while the lock file is open or the registry lists this claim."""
+        fh = self._fh
+        return (fh is not None and not fh.closed) or _OPEN_RUNS.get(self.key) is self
+
+    def acquire(self) -> None:
+        """Take the OS lock, then the registry entry. RunLockedError when another writer has the run.
+
+        When this raises, Ctrl+C included, whatever it took is recorded here for the
+        owner's release() to give back.
+        """
         with _OPEN_RUNS_LOCK:
             if self.key in _OPEN_RUNS:
                 raise RunLockedError(
-                    f"run {run_id!r} already has an open TraceWriter in this process ({run_dir}). "
+                    f"run {self.run_id!r} already has an open TraceWriter in this process ({self.run_dir}). "
                     "One writer per run: share that writer, or close it before opening another."
                 )
-            self._fd = _lock_file(self.path, run_id)
+            self._fh = _lock_file(self.path, self.run_id)
             _OPEN_RUNS[self.key] = self
 
     def release(self) -> None:
-        """Drop the OS lock and the registry entry. Safe to call twice."""
-        with _OPEN_RUNS_LOCK:
-            fd, self._fd = self._fd, None
-            if fd is None:
-                return
-            try:
-                _unlock_file(fd)
-            finally:
-                if _OPEN_RUNS.get(self.key) is self:
-                    del _OPEN_RUNS[self.key]
+        """Give back what this claim holds: close the lock file, then drop the registry entry.
+
+        Idempotent, and safe to repeat after a call that Ctrl+C cut short: each step
+        looks at what is still held, and neither can be left half done. FileIO.close
+        marks the file closed in the same C call that closes the descriptor, so a
+        repeat never closes a descriptor twice, and the registry check runs no Python
+        code, so no signal handler can run between it and the pop. The two steps sit
+        in separate finally blocks: an interrupt in one still runs the other.
+
+        A call that re-enters a release already under way (a signal handler that closes
+        the writer) returns at once and leaves the work to the outer call. Otherwise the
+        handler could close the lock file, open another writer on the freed descriptor
+        number, and the outer call would then unlock that new writer's lock.
+        """
+        if self._releasing:
+            return
+        try:
+            self._releasing = True
+            with _OPEN_RUNS_LOCK:
+                try:
+                    fh = self._fh
+                    if fh is not None and not fh.closed:
+                        try:
+                            _unlock_file(fh)
+                        finally:
+                            fh.close()
+                finally:
+                    if self.key in _OPEN_RUNS and _OPEN_RUNS[self.key] is self:
+                        _OPEN_RUNS.pop(self.key, None)
+        finally:
+            self._releasing = False
 
 
-def _lock_file(path: Path, run_id: str) -> int:
-    """An open descriptor holding the exclusive lock on ``path``; RunLockedError when someone else holds it."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+def _open_lock_file(path: Path) -> io.FileIO:
+    """``path`` open for reading and writing, created when missing, never truncated.
+
+    io.FileIO opens the file and takes the descriptor in one C call, so no Ctrl+C can
+    fall between the two and leave a descriptor open that nothing will close.
+    """
     try:
+        return io.FileIO(path, "r+")
+    except FileNotFoundError:
+        pass
+    try:
+        return io.FileIO(path, "x+")
+    except FileExistsError:  # another writer created it in between
+        return io.FileIO(path, "r+")
+
+
+def _lock_file(path: Path, run_id: str) -> io.FileIO:
+    """``path`` open, holding its exclusive OS lock. RunLockedError when someone else holds it.
+
+    Every way out but the return closes the file first, Ctrl+C included, so the lock is
+    never left held by a descriptor that nothing owns.
+    """
+    fh = _open_lock_file(path)
+    try:
+        fd = fh.fileno()
         if os.name == "nt":
             os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
-        os.close(fd)
+        fh.close()
         if exc.errno not in _LOCK_HELD_ERRNOS:
             raise
         raise RunLockedError(
@@ -379,27 +447,30 @@ def _lock_file(path: Path, run_id: str) -> int:
             "One writer per run: wait for that writer to close, or stop it."
         ) from None
     except BaseException:
-        os.close(fd)
+        fh.close()
         raise
     try:  # the holder note a refused writer reads
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, f"pid {os.getpid()}".ljust(31).encode("ascii") + b"\n")
     except OSError:
         pass
-    return fd
+    except BaseException:  # Ctrl+C: give the lock back before passing the interrupt on
+        fh.close()
+        raise
+    return fh
 
 
-def _unlock_file(fd: int) -> None:
+def _unlock_file(fh: io.FileIO) -> None:
+    """Drop the OS lock ``fh`` holds. Best effort: closing ``fh`` drops it as well."""
     try:
+        fd = fh.fileno()
         if os.name == "nt":
             os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-        pass  # closing the descriptor drops the lock as well
-    finally:
-        os.close(fd)
+    except (OSError, ValueError):  # not locked, or fh closed meanwhile (ValueError)
+        pass
 
 
 def _holder(path: Path) -> str:
@@ -528,10 +599,14 @@ def _write_all(fh: io.FileIO, data: bytes) -> None:
 
 
 def _reentered(action: str, run_id: str, instead: str) -> RuntimeError:
-    return RuntimeError(
+    """The RuntimeError for a call a signal handler made while this thread was inside emit,
+    marked so that emit passes it on unchanged wherever it surfaces."""
+    error = RuntimeError(
         f"{action} called re-entrantly on run {run_id!r}: a signal handler ran while this thread was inside "
         f"emit; set a flag in the handler and {instead} from the main loop"
     )
+    error._loopkit_reentrant = True
+    return error
 
 
 # ---------------------------------------------------------------------- the writer
@@ -547,9 +622,9 @@ class TraceWriter:
 
     Attributes: ``run_id``, ``dir`` (the run directory), ``path`` (events.jsonl),
     ``meta_path``, ``images_dir``, ``lock_path``, ``next_seq`` (the seq the next
-    event gets), ``resumed`` (the file already held events) and
+    event gets), ``resumed`` (the file already held events), ``closed`` and
     ``malformed_on_open`` (lines in the existing file that no reader accepts, such
-    as a crash's partial line).
+    as a crash's partial line: the count ``read_events`` reports as ``malformed``).
     """
 
     def __init__(self, run_id: str, meta: Mapping[str, Any] | None = None, root: str | Path | None = None):
@@ -575,10 +650,10 @@ class TraceWriter:
         self._meta: dict[str, Any] = {}
         self._next_seq, self.malformed_on_open, self._needs_newline = 0, 0, False
         self.resumed = False
-        run_lock: _RunLock | None = None
+        self._run_lock = _RunLock(self.dir, self.run_id)  # holds nothing yet: acquire() takes the run
         try:
-            run_lock = _RunLock(self.dir, self.run_id)  # one writer per run, held until close()
-            self._release_run = weakref.finalize(self, run_lock.release)  # also runs for a writer dropped unclosed
+            self._release_run = weakref.finalize(self, self._run_lock.release)  # frees a writer dropped unclosed
+            self._run_lock.acquire()  # one writer per run, held until close()
             self._next_seq, self.malformed_on_open, self._needs_newline = _scan_events(self.path)
             self.resumed = self._next_seq > 0
             # Unbuffered: each event is one write straight to the OS, so a failed write
@@ -592,11 +667,16 @@ class TraceWriter:
             else:
                 self._write_meta(new_meta)  # read, merge, write: all under the run lock
         except BaseException:
-            if self._fh is not None:
-                self._fh.close()
-                self._fh = None
-            if run_lock is not None:
-                run_lock.release()
+            try:
+                if self._fh is not None:
+                    self._fh.close()
+                    self._fh = None
+            finally:
+                # Twice: a Ctrl+C that stops the first call, even at its first line, cannot stop both.
+                try:
+                    self._run_lock.release()  # gives back whatever acquire() took, however far it got
+                finally:
+                    self._run_lock.release()
             raise
 
     # ------------------------------------------------------------------ state
@@ -606,7 +686,8 @@ class TraceWriter:
 
     @property
     def closed(self) -> bool:
-        return self._fh is None
+        """True once close() has finished: the events file is closed and the run released."""
+        return self._fh is None and not self._run_lock.held
 
     @property
     def meta(self) -> dict[str, Any]:
@@ -695,6 +776,8 @@ class TraceWriter:
                 try:
                     line = dumps(event.model_dump(mode="json")).encode("utf-8") + b"\n"
                 except Exception as exc:
+                    if getattr(exc, "_loopkit_reentrant", False):  # a signal handler's refused call, not the payload
+                        raise
                     raise ValueError(f"{what} is not JSON serializable: {type(exc).__name__}: {exc}") from exc
                 if self._needs_newline:  # an earlier write failed partway: end that partial line first
                     line = b"\n" + line
@@ -781,7 +864,12 @@ class TraceWriter:
 
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
-        """Flush and close the events file and release the run lock. Safe to call twice."""
+        """Flush and close the events file and release the run lock. Safe to call twice.
+
+        A Ctrl+C that lands inside close() still releases the run. One that stops it
+        before it starts leaves the writer open (``closed`` stays False), and calling
+        close() again finishes the job.
+        """
         with self._lock:
             if self._busy:
                 raise _reentered("close", self.run_id, "close the writer")
@@ -798,8 +886,14 @@ class TraceWriter:
                         fh.close()
             finally:
                 self._busy = False
-                if self._fh is None:  # interrupted before the file was let go: still open, still locked
-                    self._release_run()
+                if self._fh is None:  # the events file is let go: let go of the run as well
+                    # Directly, not through the finalizer, which is spent once called, done or not. Twice:
+                    # a Ctrl+C that stops the first call, even at its first line, cannot stop both.
+                    try:
+                        self._run_lock.release()
+                    finally:
+                        self._run_lock.release()
+                    self._release_run.detach()  # only now: until the run is released, dropping the writer frees it
 
     def __enter__(self) -> "TraceWriter":
         return self

@@ -920,6 +920,37 @@ def test_sigint_handler_that_logs_inside_emit_gets_an_error_not_a_hang(tmp_path)
     assert events[1].payload["reason"] == "logged from the main loop"
 
 
+def test_reentrant_call_during_serialization_raises_the_runtime_error_unwrapped(tmp_path, monkeypatch):
+    real_dumps = writer_module.dumps
+    handler = {"call": None}
+
+    def a_signal_handler_runs_inside_dumps(obj, *args, **kwargs):
+        if handler["call"] is not None:
+            call, handler["call"] = handler["call"], None
+            call()
+        return real_dumps(obj, *args, **kwargs)
+
+    monkeypatch.setattr(writer_module, "dumps", a_signal_handler_runs_inside_dumps)
+
+    def scenario():  # used to come out as "ValueError: ... is not JSON serializable: RuntimeError: ..."
+        with TraceWriter("in_dumps", root=tmp_path) as w:
+            for action, call in (
+                ("emit", lambda: w.intervention("from the handler")),
+                ("update_meta", lambda: w.update_meta({"stopped": True})),
+                ("close", w.close),
+            ):
+                handler["call"] = call
+                with pytest.raises(RuntimeError, match=rf"{action} called re-entrantly on run 'in_dumps'") as err:
+                    w.intervention("main loop")
+                assert type(err.value) is RuntimeError and err.value.__cause__ is None  # as raised, unwrapped
+            assert w.intervention("after").seq == 0  # the refused events were never written and used no seq
+
+    _with_deadline(scenario)
+    events = read_events("in_dumps", root=tmp_path)
+    assert [(e.seq, e.payload["reason"]) for e in events] == [(0, "after")]
+    assert not (tmp_path / "in_dumps" / "meta.json").exists()
+
+
 # --------------------------------------------------------------------------- pydantic models
 def test_pydantic_models_with_numpy_fields_serialize(tmp_path):
     from pydantic import BaseModel, ConfigDict, Field, field_serializer
@@ -1007,6 +1038,24 @@ def test_resume_takes_every_seq_form_the_reader_accepts(tmp_path):
     assert seqs.count(5) == 1 and max(seqs) == 5
 
 
+def test_malformed_on_open_is_the_readers_malformed_count(tmp_path):
+    rejected = [  # each has a plain int seq, as the writer writes it, and no reader accepts it
+        _line(1, "x", kind="bogus"),
+        _line(2, "", kind="model_call", payload={"usd": 0.1}),
+        json.dumps({"run_id": "f", "ts": 1.0, "seq": 7, "kind": "intervention"}),
+    ]
+    _raw_events(tmp_path, "f", _line(0, "a"), *rejected, _line(3, "b"))
+    with open(tmp_path / "f" / "events.jsonl", "ab") as fh:
+        fh.write(b'{"run_id": "f", "ts": 1.0, "se')  # and a crash's partial last line
+    events = read_events("f", root=tmp_path)
+    assert [e.seq for e in events] == [0, 3] and events.malformed_lines == [2, 3, 4, 6]
+    with TraceWriter("f", root=tmp_path) as w:  # used to count only the partial line
+        assert w.malformed_on_open == events.malformed == 4
+        assert w.next_seq == 8  # past seq 7 too, though no reader accepts that line: a seq is never reused
+        w.intervention("appended")
+    assert [e.seq for e in read_events("f", root=tmp_path)] == [0, 3, 8]
+
+
 def test_deeply_nested_line_does_not_stop_a_resume(tmp_path):
     _raw_events(tmp_path, "f", _line(0, "a"), "[" * 100_000 + "]" * 100_000)
     with TraceWriter("f", root=tmp_path) as w:
@@ -1064,3 +1113,226 @@ def test_run_folder_must_resolve_inside_its_root(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="does not resolve to a folder inside"):
         TraceWriter("nul")
     assert [p.name for p in tmp_path.rglob("*")] == ["data", "runs"]
+
+
+# --------------------------------------------------------------------------- Ctrl+C while a writer opens or closes
+_WRITER_FILE = writer_module.__file__
+
+
+def _ctrl_c_point(frame, event, arg):
+    """Where a Ctrl+C could surface for one profile event, or None for an event outside the writer.
+
+    CPython delivers Ctrl+C as a Python function starts or right after a call returns. The points
+    are: a writer.py function, or a Python function writer.py calls, starting or returning, and a
+    C function writer.py calls returning.
+    """
+    if event in ("call", "return"):
+        files = {frame.f_code.co_filename, frame.f_back.f_code.co_filename if frame.f_back else None}
+        if _WRITER_FILE in files:
+            return event, frame.f_code.co_qualname
+    elif event == "c_return" and frame.f_code.co_filename == _WRITER_FILE:
+        return event, frame.f_code.co_qualname, getattr(arg, "__name__", type(arg).__name__)
+    return None
+
+
+class _CtrlC:
+    """A profile hook that raises KeyboardInterrupt at Ctrl+C point number ``at`` (never, when None),
+    which surfaces in the writer exactly as a Ctrl+C arriving during that call would. Deterministic:
+    no timer, no second thread. ``points`` lists the points passed, ``hit`` the one interrupted."""
+
+    def __init__(self, at=None):
+        self.at, self.points, self.hit = at, [], None
+
+    def __call__(self, frame, event, arg):
+        point = _ctrl_c_point(frame, event, arg)
+        if point is None:
+            return
+        self.points.append(point)
+        if len(self.points) - 1 == self.at:
+            sys.setprofile(None)
+            self.hit = point
+            raise KeyboardInterrupt
+
+    def run(self, fn):
+        sys.setprofile(self)
+        try:
+            fn()
+        finally:
+            sys.setprofile(None)
+
+
+def _assert_run_free(root, rid):
+    """Nothing in this process still holds run ``rid``: no registry entry, no OS lock, no open lock file."""
+    run_dir = Path(os.path.abspath(Path(root) / rid))
+    assert os.path.normcase(str(run_dir)) not in writer_module._OPEN_RUNS, f"run {rid!r} is still registered"
+    TraceWriter(rid, root=root).close()  # RunLockedError while any descriptor in this process holds the lock
+    if os.name == "nt":  # Windows refuses to delete a file that a forgotten descriptor still has open
+        writer_module._retry_permission(os.unlink, run_dir / LOCK_FILE, attempts=10, step=0.02)
+
+
+# The verifier's cases A to E, as points of the restructured writer. The sweep must interrupt each.
+_NAMED_POINTS = {
+    "A: the holder note is written under the lock": ("c_return", "_lock_file", "write"),
+    "B: acquire() leaves its registry block": ("c_return", "_RunLock.acquire", "__exit__"),
+    "B: acquire() returns into TraceWriter.__init__": ("return", "_RunLock.acquire"),
+    "B: __init__ returns, the caller never gets the writer": ("return", "TraceWriter.__init__"),
+    "C: release() starts, called by close()": ("call", "_RunLock.release"),
+    "D: release() closed the lock file, the registry entry is next": ("c_return", "_RunLock.release", "close"),
+    "E: _unlock_file() starts": ("call", "_unlock_file"),
+}
+
+_OPEN_EACH = r"""
+import sys
+from loopkit.traces import RunLockedError, TraceWriter
+refused = []
+for rid in sys.stdin.read().split():
+    try:
+        TraceWriter(rid, root=sys.argv[1]).close()
+    except RunLockedError:
+        refused.append(rid)
+print("refused:", refused, flush=True)
+"""
+
+
+@pytest.mark.parametrize("resume", [False, True], ids=["new_run", "resume_with_meta"])
+def test_ctrl_c_at_any_point_of_open_or_close_leaves_the_run_free(tmp_path, resume):
+    def prepare(rid):
+        if resume:  # one event and a crash's partial line: the open scans, ends the line and merges meta
+            _raw_events(tmp_path, rid, _line(0, "before", run_id=rid))
+            with open(tmp_path / rid / "events.jsonl", "ab") as fh:
+                fh.write(b'{"run_id": "' + rid.encode())
+
+    def open_and_close(rid, box):
+        box.append(TraceWriter(rid, meta={"k": 1} if resume else None, root=tmp_path))
+        box[0].close()
+
+    TraceWriter("warm_up", root=tmp_path).close()  # one-time work (atexit registration) stays out of the sweep
+    hit, rids = set(), []
+    gc.collect()
+    gc.disable()  # what the interrupt drops must be freed at once, by reference counting alone
+    try:
+        for n in range(5000):  # point 0, 1, 2, ... until an open and close runs to the end uninterrupted
+            rid = f"r{n:05d}"  # one id length throughout: check_run_id's generator steps once per character
+            rids.append(rid)
+            prepare(rid)
+            box, inject = [], _CtrlC(at=n)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)  # a file object the interrupt dropped closes itself
+                try:
+                    inject.run(lambda: open_and_close(rid, box))
+                except KeyboardInterrupt:
+                    pass
+            if inject.hit is not None:
+                hit.add(inject.hit)
+            if box and not box[0].closed:  # what a caller does: close the writer object it has, if any
+                box[0].close()
+            _assert_run_free(tmp_path, rid)
+            if resume:
+                assert [e.seq for e in read_events(rid, root=tmp_path)] == [0]  # nothing lost, nothing added
+            if inject.hit is None:  # every point has had its turn
+                break
+    finally:
+        gc.enable()
+    assert n > 100 and inject.hit is None, f"{n} points interrupted"
+    missing = {label: point for label, point in _NAMED_POINTS.items() if point not in hit}
+    assert not missing, f"the sweep never interrupted these points: {missing}"
+    out, err = _finish(_child(_OPEN_EACH, tmp_path), 120, input="\n".join(rids))
+    assert "refused: []" in out, out + err  # free for other processes too
+
+
+def test_ctrl_c_before_close_starts_leaves_the_writer_open_and_close_finishes_later(tmp_path):
+    w = TraceWriter("late", root=tmp_path)
+    inject = _CtrlC(at=0)
+    with pytest.raises(KeyboardInterrupt):
+        inject.run(w.close)
+    assert inject.hit == ("call", "TraceWriter.close")
+    assert not w.closed  # nothing was let go: the writer still works and still holds the run
+    assert w.intervention("still open").seq == 0
+    with pytest.raises(RunLockedError, match="already has an open TraceWriter in this process"):
+        TraceWriter("late", root=tmp_path)
+    w.close()
+    assert w.closed
+    _assert_run_free(tmp_path, "late")
+    assert [e.payload["reason"] for e in read_events("late", root=tmp_path)] == ["still open"]
+
+
+def test_close_stopped_by_two_ctrl_c_says_not_closed_until_the_run_is_released(tmp_path, monkeypatch):
+    real_release = writer_module._RunLock.release
+    shots = {"left": 0}
+
+    def stopped_at_its_first_line(self):  # a Ctrl+C that lands as release() starts
+        if shots["left"]:
+            shots["left"] -= 1
+            raise KeyboardInterrupt
+        real_release(self)
+
+    monkeypatch.setattr(writer_module._RunLock, "release", stopped_at_its_first_line)
+    for finish in ("close again", "drop the writer"):
+        w = TraceWriter("twice", root=tmp_path)
+        shots["left"] = 2  # one for each of close()'s two release() calls
+        with pytest.raises(KeyboardInterrupt):
+            w.close()
+        assert not w.closed  # the events file is closed, the run is not released yet
+        with pytest.raises(ValueError, match="closed"):
+            w.intervention("late")
+        with pytest.raises(RunLockedError, match="already has an open TraceWriter in this process"):
+            TraceWriter("twice", root=tmp_path)
+        if finish == "close again":
+            w.close()
+            assert w.closed
+        else:  # the finalizer is still armed: dropping the writer frees the run
+            del w
+            gc.collect()
+        _assert_run_free(tmp_path, "twice")
+
+
+def test_a_release_reentered_from_a_handler_leaves_a_new_writer_locked(tmp_path, monkeypatch):
+    """A handler that runs inside a release, after it read the lock file's descriptor and before it
+    unlocks, then closes the writer and opens and keeps another one, must not have the outer release
+    unlock that new writer through the reused descriptor number."""
+    import loopkit.traces.writer as W
+
+    root = tmp_path / "runs"
+    w = W.TraceWriter("run_a", root=root)
+    kept, fired = [], []
+
+    def handler():
+        fired.append(True)
+        w.close()
+        kept.append(W.TraceWriter("run_b", root=root))
+
+    # the outer release's first OS call on the descriptor it read: the seek to the lock byte on Windows,
+    # the unlock itself elsewhere. The handler runs just before it, as a signal handler could.
+    if os.name == "nt":
+        real_lseek = W.os.lseek
+
+        def hooked_lseek(fd, pos, how):
+            if pos == W._LOCK_OFFSET and not fired:
+                handler()
+            return real_lseek(fd, pos, how)
+
+        monkeypatch.setattr(W.os, "lseek", hooked_lseek)
+    else:
+        real_flock = W.fcntl.flock
+
+        def hooked_flock(fd, op):
+            if op == W.fcntl.LOCK_UN and not fired:
+                handler()
+            return real_flock(fd, op)
+
+        monkeypatch.setattr(W.fcntl, "flock", hooked_flock)
+    w.close()
+    monkeypatch.undo()
+    assert fired and w.closed
+    probe = ("import sys\nfrom pathlib import Path\nfrom loopkit.traces import TraceWriter, RunLockedError\n"
+             "try:\n    TraceWriter(sys.argv[2], root=Path(sys.argv[1])).close()\n    print('opened')\n"
+             "except RunLockedError:\n    print('refused')\n")
+    other = subprocess.run([sys.executable, "-c", probe, str(root), "run_b"], capture_output=True, text=True,
+                           timeout=60)
+    assert other.stdout.strip() == "refused", other.stdout + other.stderr
+    kept[0].close()
+    for run in ("run_a", "run_b"):  # both runs are free again, here and in another process
+        W.TraceWriter(run, root=root).close()
+        again = subprocess.run([sys.executable, "-c", probe, str(root), run], capture_output=True, text=True,
+                               timeout=60)
+        assert again.stdout.strip() == "opened", again.stdout + again.stderr
