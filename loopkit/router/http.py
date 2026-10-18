@@ -8,16 +8,22 @@ returned, never raised: the adapter decides what the failure means.
 
 Spend hooks. Every POST that reaches a provider may be generated and billed, so a
 caller can pass ``hooks`` (see :class:`AttemptHooks`). ``before_attempt`` runs right
-before each POST is sent: the router reserves the call's projected cost there, and
-a SpendCapExceeded it raises propagates and stops the call. ``after_attempt``
-reports each sent POST's outcome:
+before each POST is attempted: the router reserves the call's projected cost there,
+and a SpendCapExceeded it raises propagates and stops the call. ``after_attempt``
+reports each attempt's outcome:
 
 * ``answered``: a 2xx response arrived. The router settles it at its measured cost.
 * ``rejected``: HTTP 400, 401, 402, 403, 404 or 429 with no generation id. The
   provider refused it before generating anything, so it is settled at $0.
-* ``lost``: anything else (a timeout, the per-attempt deadline, a connection error, a
-  response that dropped or failed to read, a 5xx, any other status). Its cost is
-  unknown, so its reservation stays counted at the projection.
+* ``not_sent``: no connection could be made (``httpx.ConnectError``, which covers a
+  DNS failure and a refused connection, ``httpx.ConnectTimeout``, or
+  ``httpx.PoolTimeout`` waiting for a free connection). The request never left this
+  machine, so nothing reached the provider and it is settled at $0. It is still an
+  attempt, and it is retried like any connection failure.
+* ``lost``: anything else (a read or write timeout, the per-attempt deadline, a
+  connection that dropped after the request was sent, a response that failed to
+  read, a 5xx, any other status). Its cost is unknown, so its reservation stays
+  counted at the projection.
 
 The request (body, URL and headers) is built once, before anything is reserved or
 sent. If it cannot be built (a body that is not plain JSON, a URL httpx cannot
@@ -62,7 +68,9 @@ BACKOFF_CAP_S = 20.0
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504, 520, 522, 524})
 #: statuses a provider returns before generating anything (when there is no generation id): settled at $0
 REJECTED_BEFORE_GENERATION = frozenset({400, 401, 402, 403, 404, 429})
-OUTCOMES = ("answered", "rejected", "lost")
+OUTCOMES = ("answered", "rejected", "not_sent", "lost")
+#: failures to open a connection: the request never left, so nothing reached the provider
+NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 _KEEP_HEADERS = ("retry-after", "content-type", "x-request-id", "x-generation-id")
 _ERROR_TEXT_CHARS = 4000
 
@@ -79,7 +87,7 @@ class AttemptHooks(Protocol):
 
     def after_attempt(self, token: Any, *, outcome: str, status: int | None,
                       generation_id: str | None) -> None:
-        """Called once for every POST that was sent, with its outcome (see the module docstring)."""
+        """Called once for every attempt ``before_attempt`` admitted, with its outcome (see the module docstring)."""
 
 
 def generation_id_of(data: Any, headers: Mapping[str, str] | None = None) -> str | None:
@@ -96,7 +104,10 @@ def generation_id_of(data: Any, headers: Mapping[str, str] | None = None) -> str
 
 
 def attempt_outcome(status: int | None, generation_id: str | None = None) -> str:
-    """``answered``, ``rejected`` or ``lost`` for one sent attempt (see the module docstring)."""
+    """``answered``, ``rejected`` or ``lost`` for one attempt that was sent (see the module docstring).
+
+    An attempt that could not connect is ``not_sent``; :meth:`HttpClient.post_json` marks it so itself.
+    """
     if status is None:
         return "lost"
     if 200 <= status < 300:
@@ -279,8 +290,14 @@ class HttpClient:
             t0 = time.perf_counter()
             entry: dict[str, Any] = {"attempt": attempt}
             text, data, kept = "", None, {}
+            unsent = False
             try:
                 status, raw_bytes, resp_headers = self._once(request, float(timeout_s))
+            except NOT_SENT_ERRORS as exc:  # before the timeouts: ConnectTimeout and PoolTimeout are timeouts too
+                status, unsent = None, True
+                error = redact(f"connection error: {type(exc).__name__}: {exc} (no connection was made, so "
+                               "nothing reached the provider)", key)
+                entry.update(status=None, error=error)
             except (_DeadlineExceeded, httpx.TimeoutException) as exc:
                 status, error = None, f"timeout after {timeout_s:g} s ({type(exc).__name__.lstrip('_')})"
                 entry.update(status=None, error=error)
@@ -300,7 +317,7 @@ class HttpClient:
                     text = redact(text, key)[:_ERROR_TEXT_CHARS]
                     entry["error"] = text[:300]
             gen_id = generation_id_of(data, kept) if status is not None else None
-            outcome = attempt_outcome(status, gen_id)
+            outcome = "not_sent" if unsent else attempt_outcome(status, gen_id)
             entry["outcome"] = outcome
             if gen_id:
                 entry["generation_id"] = gen_id

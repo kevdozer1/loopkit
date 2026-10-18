@@ -244,7 +244,8 @@ class OpenRouterAdapter(Adapter):
         return {"X-Title": "loopkit"}
 
     def check_entry(self, entry: "ModelEntry") -> None:
-        check_url(entry, "base_url", entry.base_url)
+        if entry.base_url is not None:  # the value as written, and the URL built from it exactly as it is sent
+            check_url(entry, "base_url", entry.base_url, sent=self.url(entry))
 
     def normalize_reasoning(self, reasoning: Any, entry: "ModelEntry") -> Any:
         return normalize_reasoning(reasoning, entry)
@@ -314,8 +315,8 @@ class OpenRouterAdapter(Adapter):
         if finish == "error" or (choice_error and isinstance(choice_error, (dict, str))):
             detail = redact(_error_message(choice_error), key)[:300]
             raise ModelCallError(
-                f"{where}: the generation failed upstream (finish_reason {finish or 'missing'}"
-                f"{': ' + detail if detail else ''}); its partial answer is not used or cached",
+                redact(f"{where}: the generation failed upstream (finish_reason {finish or 'missing'}"
+                       f"{': ' + detail if detail else ''}); its partial answer is not used or cached", key),
                 status=res.status, attempts=attempts, generation_id=gen_id, usd=cost,
                 raw={"attempt_log": log, "response": scrub(data, key), "usage": tokens,
                      "finish_reason": finish or "error"})

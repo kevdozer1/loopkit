@@ -55,7 +55,8 @@ class JevAdapter(Adapter):
         return entry.endpoint or DEFAULT_URL
 
     def check_entry(self, entry: "ModelEntry") -> None:
-        check_url(entry, "endpoint", entry.endpoint)
+        if entry.endpoint is not None:  # sent exactly as written
+            check_url(entry, "endpoint", entry.endpoint, sent=self.url(entry))
 
     def normalize_reasoning(self, reasoning: Any, entry: "ModelEntry") -> Any:
         return None  # the System One API has no reasoning setting

@@ -56,10 +56,13 @@ class ModelCallError(RouterError):
     request that could not be built) and ``attempts`` the number of HTTP attempts
     made over every JSON mode. ``rejected_before_generation`` is True only when no
     attempt of the call was lost or answered: each one was refused before generating
-    anything (HTTP 400/401/402/403/404/429 with no generation id) or never sent. The
-    ledger settles each refused attempt at $0 and keeps every other attempt reserved
-    at its projection. ``usd`` is a provider-reported cost when the failed response
-    carried one (for example a 200 whose generation failed upstream).
+    anything (HTTP 400/401/402/403/404/429 with no generation id) or never sent (the
+    request could not be built, or no connection could be made). The ledger settles
+    each refused or unsent attempt at $0 and keeps every other attempt reserved at
+    its projection. ``usd`` is the cost a 2xx response reported for a generation that
+    failed (for example a 200 with finish_reason "error"); the answering attempt is
+    settled at it. A cost in a non-2xx body is never put here: that attempt's
+    outcome is unknown, so it stays counted at its projection.
     """
 
     def __init__(self, message: str, *, status: int | None = None, attempts: int = 0,

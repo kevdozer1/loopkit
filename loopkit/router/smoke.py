@@ -37,7 +37,7 @@ from .core import chat, resolve_route
 from .errors import ModelCallError
 from .http import HttpClient
 from .ledger import Ledger
-from .redact import redact, strip_secret
+from .redact import redact, secret_forms, strip_secret
 
 SESSION = "S1"
 SESSION_CAP_USD = 1.0
@@ -234,8 +234,10 @@ def _loaded_keys(models: ModelsConfig) -> list[str]:
 
 
 def _guard(text: str, secrets: list[str]) -> str:
+    """``text`` without any loaded key, as written or JSON-escaped (the table is written as JSON)."""
     for secret in secrets:
-        text = text.replace(secret, "[redacted]")
+        for form in secret_forms(secret):
+            text = text.replace(form, "[redacted]")
     return text
 
 

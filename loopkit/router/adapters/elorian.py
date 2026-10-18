@@ -98,7 +98,7 @@ class ElorianAdapter(OpenRouterAdapter):
             raise ModelNotConfigured(
                 f"model {entry.key!r} uses the elorian adapter but config/models.yaml has no base_url for it. "
                 "Set base_url to the provider's chat-completions API root (from its API docs).")
-        check_url(entry, "base_url", entry.base_url)
+        check_url(entry, "base_url", entry.base_url, sent=self.url(entry))
 
     def url(self, entry: "ModelEntry") -> str:
         base = str(entry.base_url).rstrip("/")

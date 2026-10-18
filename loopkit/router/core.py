@@ -3,8 +3,10 @@
 Order of operations for one call:
 
 1. Look up the models.yaml entry. A non-fake entry without an id is not callable yet
-   (ModelNotConfigured); so is an elorian entry without a base_url, or a URL httpx
-   cannot parse.
+   (ModelNotConfigured); so is an elorian entry without a base_url, or a base_url or
+   endpoint that is not usable: checked as written (leading or trailing whitespace,
+   any space or control character is refused) and as the exact URL the adapter will
+   send (httpx must parse it, http or https, with a real host).
 2. Normalize messages and images. ``json_schema``, ``extra`` and the reasoning
    setting become plain JSON (numpy scalars and arrays turn into numbers and lists),
    so the request body always serializes. Hash the canonical request: adapter, model
@@ -26,17 +28,25 @@ Order of operations for one call:
    (SpendCapExceeded). Every call except the FakeModel at a $0 projection is paid:
    it needs an active session, and a reached cap refuses it even at $0.
 7. The adapter sends it. Per attempt: a refusal before generation (HTTP
-   400/401/402/403/404/429 with no generation id) settles at $0; a lost attempt
-   (timeout, deadline, dropped connection or read error, 5xx, a 200 without usage)
-   stays reserved at its projection, because the provider may have generated and
-   billed it; the attempt that answered settles at its cost.
+   400/401/402/403/404/429 with no generation id) settles at $0; so does an attempt
+   that could not connect (``httpx.ConnectError``, including a DNS failure or a
+   refused connection, ``ConnectTimeout`` or ``PoolTimeout``), because nothing
+   reached the provider; a lost attempt (read timeout, deadline, a connection dropped
+   after the request was sent, read error, 5xx, a 200 without usage) stays reserved
+   at its projection, because the provider may have generated and billed it; the
+   attempt that answered settles at its cost. A cost read from a non-2xx body never
+   settles anything: only an answered (2xx) attempt, or the FakeModel's one unsent
+   reservation, settles at a reported cost.
 8. The answer's cost is the provider's ``usage.cost`` (plus
    ``cost_details.upstream_inference_cost`` on a BYOK account) when given
-   (``usd_source: provider``), unless that is below half the cost computed from its
-   token counts at the models.yaml prices, which is then used instead (``computed``,
-   with a note in ``raw``); else it is computed from tokens (``computed``), adding
-   reasoning tokens unless the adapter counts them inside the output. A cost that is
-   not a finite number settles at the projection.
+   (``usd_source: provider``), unless that is below half the cost of the token
+   counts it reported at the models.yaml prices (a count it left out counts as 0
+   there), in which case the computed cost is used instead (``computed``, with a note
+   in ``raw``); else it is computed from tokens (``computed``), adding reasoning
+   tokens unless the adapter counts them inside the output, and taking a count that
+   was not reported from the projection. A token count that is not a whole number
+   from 0 to below 10**12 is treated as not reported, with a note. A cost that is not
+   a finite number, or that cannot be computed at all, settles at the projection.
 9. With a JSON schema, the answer is parsed (code fences and leading prose dropped)
    and validated. Any parse or validation failure becomes ``Response.json_error``,
    never an exception. No repair here.
@@ -44,6 +54,16 @@ Order of operations for one call:
     "error") raises ModelCallError and is never cached. One ``model_call`` trace
     event is emitted per call, also when something fails after the provider was
     paid; the ledger is settled (conservatively) before any exception is re-raised.
+    Once the provider has answered, chat() raises nothing but a RouterError (or an
+    interrupt such as KeyboardInterrupt): an answer the adapter cannot read is a
+    ModelCallError, and any other failure after the call (a cache write, the trace
+    writer) is re-raised as a RouterError that names it.
+
+Key safety: every string that comes back from the provider (the answer, its model
+name, finish reason, generation id and upstream provider, the attempt log) has the
+key cut in each of its forms (as written and JSON-escaped) before it reaches the
+Response, the trace, the cache or an error. An answer returned as data (Jev's
+answers) has its text rebuilt as ``json.dumps`` of the scrubbed value.
 
 Trace and Response accounting: ``usd`` is the answer's cost on success (the
 ledger's count for the call on failure). ``ledger_usd`` is everything the ledger
@@ -56,6 +76,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import operator
 import re
 import threading
 import time
@@ -68,7 +89,15 @@ from .. import config
 from ..config import MissingCredentialError, ModelEntry, ModelsConfig, load_secret
 from ..schemas.jsonschema_lite import check
 from .adapters import get_adapter
-from .adapters.base import Adapter, AdapterRequest, AdapterResult, as_cost, as_int, reasoning_level
+from .adapters.base import (
+    MAX_TOKEN_COUNT,
+    Adapter,
+    AdapterRequest,
+    AdapterResult,
+    as_cost,
+    as_int,
+    reasoning_level,
+)
 from .cache import DiskCache
 from .errors import ModelCallError, ModelNotConfigured, RouterError
 from .http import HttpClient, default_client
@@ -295,9 +324,61 @@ def project(entry: ModelEntry, models: ModelsConfig, text_chars: int, image_coun
     return est_in, est_in * pin / 1e6 + max_tokens * pout / 1e6, fallback
 
 
+TOKEN_COUNT_FIELDS = ("input_tokens", "output_tokens", "reasoning_tokens", "cached_tokens")
+
+
+def _describe(value: Any) -> str:
+    """A provider value for a note: a number as it is (a huge one by its size), anything else by its type only.
+
+    A string is never quoted: it could hold the key.
+    """
+    if value is None or isinstance(value, (bool, float)):
+        return repr(value)
+    if isinstance(value, int):
+        if abs(value) < 10 ** 15:
+            return repr(value)
+        return f"an integer of about {int(abs(value).bit_length() * 0.30103) + 1} digits"
+    return f"a value of type {type(value).__name__}"
+
+
+def clean_token_counts(result: Any) -> list[str]:
+    """Set each token count of ``result`` that is not a count to None (not reported), with a note for each.
+
+    A count is a whole number from 0 to below 10**12 (an integral float, or a numpy
+    integer, is taken as its int). Anything else, for example ``10**400``, ``1e300``,
+    a negative number or a string, would break or distort the cost, so it is dropped.
+    """
+    notes: list[str] = []
+    for name in TOKEN_COUNT_FIELDS:
+        value = getattr(result, name, None)
+        if value is None:
+            continue
+        count: int | None = None
+        if not isinstance(value, bool):
+            try:
+                count = operator.index(value)  # int, numpy integers
+            except TypeError:
+                if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+                    count = int(value)
+        if count is not None and 0 <= count < MAX_TOKEN_COUNT:
+            if type(value) is not int:
+                setattr(result, name, int(count))
+            continue
+        setattr(result, name, None)
+        notes.append(f"the provider's {name} ({_describe(value)}) is not a token count (a whole number from 0 to "
+                     "below 10**12), so it was treated as not reported")
+    return notes
+
+
 def _token_cost(result: AdapterResult, entry: ModelEntry, models: ModelsConfig, est_in: int,
-                max_tokens: int) -> tuple[float | None, list[str]]:
-    """The cost computed from the result's token counts at models.yaml prices (None with no counts)."""
+                max_tokens: int, *, fill_missing: bool = True) -> tuple[float | None, list[str]]:
+    """The cost computed from the result's token counts at models.yaml prices (None with no counts).
+
+    With ``fill_missing`` a count the provider did not report comes from the
+    projection (the input estimate, the output allowance), with a note. Without it a
+    missing count is 0: the cost of what was reported, the floor a provider's own
+    figure is checked against. Never raises: counts too large to price cost infinity.
+    """
     n_in, n_out = result.input_tokens, result.output_tokens
     if n_in is None and n_out is None:
         return None, []
@@ -307,26 +388,32 @@ def _token_cost(result: AdapterResult, entry: ModelEntry, models: ModelsConfig, 
         notes.append(f"models.yaml has no price for {entry.key}: cost computed at Astra prices "
                      f"({pin:.2f} / {pout:.2f} per million tokens)")
     if n_in is None:
-        n_in = est_in
-        notes.append("input tokens not reported: the projection's estimate was used")
+        n_in = est_in if fill_missing else 0
+        notes.append("input tokens not reported: the projection's estimate was used" if fill_missing
+                     else "input tokens not reported: counted as 0")
     if n_out is None:
-        n_out = max_tokens
+        n_out = max_tokens if fill_missing else 0
         notes.append("output tokens not reported: the output allowance (max_tokens plus any reasoning budget) "
-                     "was used")
-    reasoning = int(result.reasoning_tokens or 0)
-    inside = getattr(result, "reasoning_in_output", True)
-    if reasoning > 0 and inside is not True:
-        n_out += reasoning
-        if inside is False:
-            notes.append("reasoning tokens are reported separately and were added to the output tokens")
-        elif result.output_tokens is not None and reasoning > result.output_tokens:
-            notes.append("reasoning tokens exceed the output tokens, so they are reported separately and were added")
-        else:
-            notes.append("whether this provider's output tokens include reasoning tokens is unknown, so they were "
-                         "added (conservative)")
-    n_cached = min(max(int(result.cached_tokens or 0), 0), int(n_in))
-    rate_cached = cached_in if (cached_in is not None and fallback is None) else pin
-    usd = ((n_in - n_cached) * pin + n_cached * rate_cached + n_out * pout) / 1e6
+                     "was used" if fill_missing else "output tokens not reported: counted as 0")
+    try:
+        reasoning = int(result.reasoning_tokens or 0)
+        inside = getattr(result, "reasoning_in_output", True)
+        if reasoning > 0 and inside is not True:
+            n_out += reasoning
+            if inside is False:
+                notes.append("reasoning tokens are reported separately and were added to the output tokens")
+            elif result.output_tokens is not None and reasoning > result.output_tokens:
+                notes.append("reasoning tokens exceed the output tokens, so they are reported separately and were "
+                             "added")
+            else:
+                notes.append("whether this provider's output tokens include reasoning tokens is unknown, so they "
+                             "were added (conservative)")
+        n_cached = min(max(int(result.cached_tokens or 0), 0), int(n_in))
+        rate_cached = cached_in if (cached_in is not None and fallback is None) else pin
+        usd = ((n_in - n_cached) * pin + n_cached * rate_cached + n_out * pout) / 1e6
+    except (ArithmeticError, TypeError, ValueError):  # e.g. OverflowError for a count past float range
+        notes.append("the token counts cannot be priced (too large or not numbers)")
+        usd = float("inf")
     return usd, notes
 
 
@@ -338,17 +425,26 @@ def cost_known(result: AdapterResult) -> bool:
 
 def settled_cost(result: AdapterResult, entry: ModelEntry, models: ModelsConfig, projected: float,
                  est_in: int, max_tokens: int) -> tuple[float, str, list[str]]:
-    """(usd, usd_source, notes) for a call that returned. ``max_tokens`` is the output allowance."""
+    """(usd, usd_source, notes) for a call that returned. ``max_tokens`` is the output allowance.
+
+    A provider cost below half of what the token counts it reported cost (a count it
+    left out counts as 0) is not trusted: the call is settled at the computed cost,
+    which takes a missing count from the projection.
+    """
     notes: list[str] = []
     computed, computed_notes = _token_cost(result, entry, models, est_in, max_tokens)
     reported = as_cost(result.usd)
     if result.usd is not None and reported is None:
-        notes.append(f"the provider's cost {result.usd!r} is not a finite non-negative number and was ignored")
+        notes.append(f"the provider's cost ({_describe(result.usd)}) is not a finite non-negative number and was "
+                     "ignored")
     if reported is not None:
-        both = result.input_tokens is not None and result.output_tokens is not None
-        if both and computed is not None and math.isfinite(computed) and reported < PROVIDER_COST_FLOOR * computed:
-            notes.append(f"the provider reported ${reported:.6f}, below half the ${computed:.6f} computed from its "
-                         "token counts at models.yaml prices, so the call is settled at the computed cost")
+        floor, _floor_notes = _token_cost(result, entry, models, est_in, max_tokens, fill_missing=False)
+        if floor is not None and math.isfinite(floor) and reported < PROVIDER_COST_FLOOR * floor:
+            partial = result.input_tokens is None or result.output_tokens is None
+            notes.append(f"the provider reported ${reported:.6f}, below half the ${floor:.6f} computed from its "
+                         "token counts at models.yaml prices"
+                         + (" (the count it did not report counted as 0)" if partial else "")
+                         + ", so the call is settled at the computed cost")
             notes.extend(computed_notes)
             usd, source = computed, "computed"
         else:
@@ -538,6 +634,9 @@ class _CallSpend:
         rec["state"], rec["status"] = outcome, status
         if outcome == "rejected":
             self._settle(rec, 0.0, "computed", f"HTTP {status} before generation, recorded as 0", quiet=True)
+        elif outcome == "not_sent":  # still an attempt (and retried), but nothing reached the provider
+            self._settle(rec, 0.0, "computed", "no connection could be made, so nothing reached the provider; "
+                         "recorded as 0", quiet=True)
 
     # ------------------------------------------------------------------ settling
     def _settle(self, rec: dict[str, Any], usd: float, source: str, note: str | None, *, quiet: bool) -> None:
@@ -550,10 +649,27 @@ class _CallSpend:
         rec["usd"], rec["settled"] = float(usd), True
 
     def _answer_record(self) -> dict[str, Any] | None:
+        """The attempt a reported cost may settle, or None.
+
+        The last attempt that answered (a 2xx), or, for a call that sends no HTTP (the
+        FakeModel), its one reservation, which was never sent. Never a lost or refused
+        attempt: a cost read from a non-2xx body settles nothing.
+        """
         for rec in reversed(self.attempts):
             if rec["state"] == "answered":
                 return rec
-        return self.attempts[-1] if self.attempts else None
+        if len(self.attempts) == 1 and self.attempts[0]["state"] == "reserved":
+            return self.attempts[0]
+        return None
+
+    @property
+    def answered(self) -> bool:
+        """True once an attempt got a 2xx answer: the provider answered."""
+        return any(a["state"] == "answered" for a in self.attempts)
+
+    @property
+    def answered_status(self) -> int | None:
+        return next((a["status"] for a in reversed(self.attempts) if a["state"] == "answered"), None)
 
     def settle_answer(self, usd: float, source: str, note: str | None, *, known: bool) -> None:
         """Settle the attempt that answered at ``usd``; with ``known`` false it stays reserved."""
@@ -566,7 +682,13 @@ class _CallSpend:
             self._settle(rec, usd, source, note, quiet=False)
 
     def settle_failure(self, exc: BaseException, cost_of: Any) -> str:
-        """Settle what a failed call's error tells; everything else stays reserved. Returns the usd_source."""
+        """Settle what a failed call's error tells; everything else stays reserved. Returns the usd_source.
+
+        A cost on the error (``exc.usd``) settles only the attempt that answered (a 2xx
+        whose generation failed), or the FakeModel's one unsent reservation. When no
+        attempt answered it settles nothing, so every lost attempt stays counted at its
+        projection.
+        """
         if not isinstance(exc, ModelCallError):
             return "computed"
         if exc.rejected_before_generation:
@@ -576,14 +698,15 @@ class _CallSpend:
                                  "refused before generation or could not be built), recorded as 0", quiet=True)
             return "computed"
         if exc.usd is not None:
-            usd, source, notes = cost_of(exc)
             rec = self._answer_record()
-            if rec is not None:
-                if rec["state"] == "reserved":
-                    rec["state"] = "answered"
-                self._settle(rec, usd, source, "failed call: " + ("; ".join(notes) or "cost reported with the error"),
-                             quiet=True)
-                return source if rec["settled"] else "computed"
+            if rec is None:
+                return "computed"
+            usd, source, notes = cost_of(exc)
+            if rec["state"] == "reserved":
+                rec["state"] = "answered"
+            self._settle(rec, usd, source, "failed call: " + ("; ".join(notes) or "cost reported with the error"),
+                         quiet=True)
+            return source if rec["settled"] else "computed"
         return "computed"
 
     # ------------------------------------------------------------------ accounting
@@ -611,7 +734,51 @@ def _failed_call_cost(exc: ModelCallError, adapter: Adapter, entry: ModelEntry, 
                           reasoning_tokens=as_int(usage.get("reasoning_tokens")),
                           cached_tokens=as_int(usage.get("cached_tokens")), usd=exc.usd,
                           reasoning_in_output=adapter.reasoning_in_output)
-    return settled_cost(probe, entry, models, projected, est_in, max_out)
+    notes = clean_token_counts(probe)
+    usd, source, cost_notes = settled_cost(probe, entry, models, projected, est_in, max_out)
+    return usd, source, notes + cost_notes
+
+
+def _provider_text(value: Any, key: str) -> str | None:
+    """A string the provider sent (a model name, finish reason, generation id...) without the key in any form."""
+    if value is None:
+        return None
+    return strip_secret(value if isinstance(value, str) else str(value), key)
+
+
+def _answer_text(value: Any, fallback: str) -> str:
+    """The text of an answer returned as data (Jev's answers): ``json.dumps`` of the scrubbed value."""
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError, RecursionError):
+        return fallback
+
+
+def _scrub_error(exc: ModelCallError, key: str) -> None:
+    """A failed call's message, generation id and raw details (the attempt log among them) without the key.
+
+    The adapters scrub their messages already; this is the one place that makes sure, for any adapter. Never raises.
+    """
+    try:
+        if exc.args and isinstance(exc.args[0], str):
+            exc.args = (redact(exc.args[0], key, media=False), *exc.args[1:])
+        if exc.generation_id is not None:
+            exc.generation_id = _provider_text(exc.generation_id, key)
+        if exc.raw:
+            exc.raw = scrub(exc.raw, key, media=False)
+    except Exception:  # noqa: BLE001 - the call's own error matters more
+        pass
+
+
+def _after_answer(exc: BaseException, model_key: str, model_id: str, label: str, key: str) -> BaseException:
+    """``exc``, raised after the provider answered, as a RouterError: nothing else leaves chat() then.
+
+    A RouterError, and an interrupt (KeyboardInterrupt, SystemExit), come back unchanged.
+    """
+    if isinstance(exc, RouterError) or not isinstance(exc, Exception):
+        return exc
+    return RouterError(redact(f"{model_key} ({model_id}) via {label}: the provider answered, but the router failed "
+                              f"after the call ({type(exc).__name__}: {_clip(str(exc), 300)})", key))
 
 
 # --------------------------------------------------------------------------- trace
@@ -813,53 +980,87 @@ def chat(model_key: str, messages: list[dict] | str, images: list | None = None,
     # 7. send
     client = http if http is not None else default_client()
     t_send = time.perf_counter()
+    sent_error: BaseException | None = None
     try:
         result = adapter.send(request, key, client)
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001 - settled, traced and re-raised just below
+        sent_error = exc
+    if sent_error is not None:
         latency_ms = (time.perf_counter() - t_send) * 1000.0
+        error = sent_error
+        if spend.answered and isinstance(error, Exception) and not isinstance(error, RouterError):
+            # the provider answered but the adapter could not read the answer: a ModelCallError, never anything
+            # else; the answered attempt stays counted at its projection, because its cost was never read
+            error = ModelCallError(
+                redact(f"{model_key} ({model_id}) via {adapter.label}: the provider answered (HTTP "
+                       f"{spend.answered_status}), but the answer could not be read ({type(sent_error).__name__}: "
+                       f"{_clip(str(sent_error), 300)})", key),
+                status=spend.answered_status, attempts=spend.sent, raw={"error_type": type(sent_error).__name__})
+        if isinstance(error, ModelCallError):
+            _scrub_error(error, key)
         source = "computed"
         try:
-            source = spend.settle_failure(exc, lambda e: _failed_call_cost(e, adapter, entry, cfg, projected, est_in,
-                                                                             max_out))
+            source = spend.settle_failure(error, lambda e: _failed_call_cost(e, adapter, entry, cfg, projected,
+                                                                               est_in, max_out))
         except Exception:  # noqa: BLE001 - unsettled is the conservative outcome; the call's error matters more
             pass
         if trace is not None:
             try:
-                raw_err = getattr(exc, "raw", None)
-                attempts = getattr(exc, "attempts", None)
-                _emit(trace, payload(ok=False, error=redact(f"{type(exc).__name__}: {exc}", key),
+                raw_err = getattr(error, "raw", None)
+                attempts = getattr(error, "attempts", None)
+                finish = raw_err.get("finish_reason") if isinstance(raw_err, dict) else None
+                _emit(trace, payload(ok=False, error=redact(f"{type(error).__name__}: {error}", key),
                                      usd=spend.counted(), usd_source=source, latency_ms=latency_ms,
-                                     http_status=getattr(exc, "status", None),
+                                     http_status=getattr(error, "status", None),
                                      attempts=attempts if attempts is not None else (spend.sent or None),
-                                     finish_reason=raw_err.get("finish_reason") if isinstance(raw_err, dict) else None,
-                                     **spend.fields()))
+                                     finish_reason=_provider_text(finish, key), **spend.fields()))
             except Exception:  # noqa: BLE001 - the call's own error matters more
                 pass
-        raise
+        if error is sent_error:
+            raise sent_error
+        raise error from None
     latency_ms = (time.perf_counter() - t_send) * 1000.0
 
-    # 8. cost and settle. From here on nothing escapes before the ledger is settled and the event is written.
+    # 8. cost and settle. The provider has answered: from here on nothing escapes before the ledger is settled and
+    # the event is written, a cost that cannot be computed is the projection (the paid answer is kept), and only a
+    # RouterError (or an interrupt) is raised.
     failure: BaseException | None = None
     usd, usd_source, notes, known = float(projected), "computed", [], False
     try:
-        usd, usd_source, notes = settled_cost(result, entry, cfg, projected, est_in, max_out)
+        notes = clean_token_counts(result)  # 10**400 tokens is not a count: dropped, with a note
+        usd, usd_source, cost_notes = settled_cost(result, entry, cfg, projected, est_in, max_out)
+        notes = notes + cost_notes
         known = cost_known(result)
-    except BaseException as exc:  # noqa: BLE001
-        failure = exc  # the cost is unknown: the reservation stays counted at the projection
+    except Exception as exc:  # noqa: BLE001 - the cost is unknown: the reservation stays counted at the projection
+        usd, usd_source, known = float(projected), "computed", False
+        notes = notes + [f"the cost could not be computed ({type(exc).__name__}: {_clip(str(exc))}), so the call "
+                         "stays counted at its projection"]
+    except BaseException as exc:  # noqa: BLE001 - an interrupt: re-raised once the event is written
+        failure = exc
+    note = redact("; ".join(notes), key, media=False) if notes else None
     try:
-        spend.settle_answer(usd, usd_source, "; ".join(notes) if notes else None, known=known and failure is None)
+        spend.settle_answer(usd, usd_source, note, known=known and failure is None)
     except BaseException as exc:  # noqa: BLE001
         failure = failure or exc
     spent_fields = spend.fields()
 
+    # every string from the provider, without the key in any of its forms, before the Response, trace or cache
+    model_name, finish_reason, generation_id, upstream = model_id, None, None, None
+    try:
+        model_name = _provider_text(getattr(result, "model_returned", None), key) or model_id
+        finish_reason = _provider_text(getattr(result, "finish_reason", None), key)
+        generation_id = _provider_text(getattr(result, "generation_id", None), key)
+        upstream = _provider_text(getattr(result, "upstream_provider", None), key)
+    except Exception:  # noqa: BLE001 - a field that cannot be read as text is left out
+        pass
+
     # 9-10. JSON, the response and the cache
     text, json_error, response = "", None, None
-    model_name = getattr(result, "model_returned", None) or model_id
     if failure is None:
         try:
             raw = scrub(result.raw or {}, key)
-            if notes:
-                raw["usd_note"] = "; ".join(notes)
+            if note:
+                raw["usd_note"] = note
             if route_note:
                 raw["route_note"] = route_note
             if price_fallback and usd_source == "computed":
@@ -871,29 +1072,30 @@ def chat(model_key: str, messages: list[dict] | str, images: list | None = None,
                 raw["unreconciled_attempts"] = spent_fields["unreconciled_attempts"]
                 raw["unreconciled_reserved_usd"] = spent_fields["unreconciled_reserved_usd"]
             raw["ledger_usd"] = spent_fields["ledger_usd"]
-            text = result.text or ""
-            if key and len(key) >= 6 and key in text:  # only the exact key; the answer is otherwise kept as written
-                text = text.replace(key, "[redacted]")
+            # only the key is cut, as written and JSON-escaped; the answer is otherwise kept as written
+            text = strip_secret(result.text or "", key)
             json_value = strip_secret(result.json_value, key)
+            if result.json_value is not None:  # an answer returned as data (Jev): its text is the scrubbed value's
+                text = _answer_text(json_value, text)
             value, json_error = _json_result(text, json_value, schema_d)
             response = Response(
                 text=text, json=value, json_error=json_error, model_key=model_key, provider=adapter.name,
                 model=model_name, role=role, input_tokens=result.input_tokens, output_tokens=result.output_tokens,
                 reasoning_tokens=result.reasoning_tokens, cached_tokens=result.cached_tokens, usd=usd,
                 usd_source=usd_source, latency_ms=latency_ms, cache_hit=False, request_hash=rhash,
-                finish_reason=result.finish_reason, reasoning_setting=reasoning_setting, json_mode=result.json_mode,
+                finish_reason=finish_reason, reasoning_setting=reasoning_setting, json_mode=result.json_mode,
                 image_count=len(imgs), est_input_tokens=est_in, projected_usd=projected, raw=raw)
-            if use_cache and text.strip() and result.finish_reason != "error":
+            if use_cache and text.strip() and finish_reason != "error":
                 record = {
                     "request_hash": rhash, "created": time.time(), "model_key": model_key, "provider": adapter.name,
                     "adapter": entry.adapter, "model": model_name, "model_requested": model_id, "text": text,
                     "json_value": json_value, "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens, "reasoning_tokens": result.reasoning_tokens,
                     "cached_tokens": result.cached_tokens, "usd": usd, "usd_source": usd_source,
-                    "latency_ms": round(latency_ms, 3), "finish_reason": result.finish_reason,
+                    "latency_ms": round(latency_ms, 3), "finish_reason": finish_reason,
                     "json_mode": result.json_mode, "reasoning_setting": reasoning_setting,
                     "http_status": result.http_status, "attempts": result.attempts,
-                    "generation_id": result.generation_id, "upstream_provider": result.upstream_provider,
+                    "generation_id": generation_id, "upstream_provider": upstream,
                     "ledger_usd": spent_fields["ledger_usd"], "raw": cached_raw,
                 }
                 store.put(rhash, record)
@@ -906,17 +1108,24 @@ def chat(model_key: str, messages: list[dict] | str, images: list | None = None,
                     reasoning_tokens=getattr(result, "reasoning_tokens", None),
                     cached_tokens=getattr(result, "cached_tokens", None),
                     usd=usd if failure is None else spend.counted(), usd_source=usd_source, latency_ms=latency_ms,
-                    finish_reason=getattr(result, "finish_reason", None), json_mode=getattr(result, "json_mode", None),
+                    finish_reason=finish_reason, json_mode=getattr(result, "json_mode", None),
                     http_status=getattr(result, "http_status", None), attempts=getattr(result, "attempts", None),
-                    json_error=json_error, upstream_provider=getattr(result, "upstream_provider", None),
-                    ok=failure is None,
+                    json_error=json_error, upstream_provider=upstream, ok=failure is None,
                     error=None if failure is None else redact(f"{type(failure).__name__}: {failure}", key),
                     **spent_fields)
-    if failure is not None:
+    if failure is None:
+        try:
+            _emit(trace, event)
+        except BaseException as exc:  # noqa: BLE001 - the trace writer failed after a paid call
+            failure = exc
+        else:
+            return response
+    else:
         try:
             _emit(trace, event)
         except Exception:  # noqa: BLE001 - the original error matters more
             pass
+    error = _after_answer(failure, model_key, model_id, adapter.label, key)
+    if error is failure:
         raise failure
-    _emit(trace, event)
-    return response
+    raise error from None

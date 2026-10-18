@@ -5,10 +5,15 @@ so a base64 character may also appear as an escaped ``/`` or ``+``, and padding 
 an escaped ``=``. The patterns follow that. Credentials are cut from every string;
 media is cut from error text and from stored provider responses, but never from a
 model's answer text (an answer is kept as the model wrote it).
+
+A key is cut in every form it can take in text: as written, and as JSON text holds
+it (``json.dumps(key)[1:-1]``, so a key with a quote or a backslash is also caught
+escaped; see :func:`secret_forms`).
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable
 from typing import Any
@@ -35,22 +40,40 @@ _SECRET_RES = (
 )
 
 REDACTED = "[redacted]"
+_MIN_SECRET_CHARS = 6
+
+
+def secret_forms(secret: str) -> list[str]:
+    """``secret`` in every form text can hold it, longest first.
+
+    As written, and as JSON text holds it: ``json.dumps(secret)[1:-1]`` (a quote or
+    a backslash escaped), with and without non-ASCII escaped, and with ``/`` also
+    written as ``\\/`` (some JSON encoders do that). Most keys have one form only.
+    """
+    forms = {secret}
+    for ascii_only in (True, False):
+        escaped = json.dumps(secret, ensure_ascii=ascii_only)[1:-1]
+        forms.add(escaped)
+        forms.add(escaped.replace("/", "\\/"))
+    return sorted(forms, key=lambda s: (-len(s), s))
 
 
 def _secrets(secrets: str | Iterable[str | None] | None) -> list[str]:
+    """Every form of every secret of 6 or more characters, longest first (so a longer form is cut whole)."""
     if secrets is None:
         return []
     if isinstance(secrets, str):
         secrets = [secrets]
-    return [s for s in secrets if s and len(s) >= 6]
+    forms: set[str] = set()
+    for secret in secrets:
+        if isinstance(secret, str) and len(secret) >= _MIN_SECRET_CHARS:
+            forms.update(secret_forms(secret))
+    return sorted(forms, key=lambda s: (-len(s), s))
 
 
-def redact(text: str, secrets: str | Iterable[str | None] | None = None, *, media: bool = True) -> str:
-    """``text`` without credentials and (with ``media``) without data URLs or long base64 runs."""
-    if not isinstance(text, str):
-        text = str(text)
-    for secret in _secrets(secrets):
-        text = text.replace(secret, REDACTED)
+def _redact(text: str, forms: list[str], media: bool) -> str:
+    for form in forms:
+        text = text.replace(form, REDACTED)
     for pattern in _SECRET_RES:
         text = pattern.sub(REDACTED, text)
     if media:
@@ -60,45 +83,57 @@ def redact(text: str, secrets: str | Iterable[str | None] | None = None, *, medi
     return text
 
 
+def redact(text: str, secrets: str | Iterable[str | None] | None = None, *, media: bool = True) -> str:
+    """``text`` without credentials and (with ``media``) without data URLs or long base64 runs."""
+    if not isinstance(text, str):
+        text = str(text)
+    return _redact(text, _secrets(secrets), media)
+
+
 def _forbidden(key: Any) -> bool:
     return str(key).lower().replace("_", "-") in FORBIDDEN_KEYS
 
 
 def scrub(obj: Any, secrets: str | Iterable[str | None] | None = None, *, media: bool = True) -> Any:
     """A JSON-safe copy of ``obj`` without header or credential keys and with every string redacted."""
-    keys = _secrets(secrets)
-    return _scrub(obj, keys, media, 0)
+    return _scrub(obj, _secrets(secrets), media, 0)
 
 
-def _scrub(obj: Any, keys: list[str], media: bool, depth: int) -> Any:
+def _scrub(obj: Any, forms: list[str], media: bool, depth: int) -> Any:
     if depth > 64:
         return "[too deep]"
     if isinstance(obj, dict):  # keys are text too: a server can echo a credential as a key
-        return {redact(str(k), keys, media=media): _scrub(v, keys, media, depth + 1)
+        return {_redact(str(k), forms, media): _scrub(v, forms, media, depth + 1)
                 for k, v in obj.items() if not _forbidden(k)}
     if isinstance(obj, (list, tuple)):
-        return [_scrub(v, keys, media, depth + 1) for v in obj]
+        return [_scrub(v, forms, media, depth + 1) for v in obj]
     if isinstance(obj, str):
-        return redact(obj, keys, media=media)
+        return _redact(obj, forms, media)
     if isinstance(obj, (bytes, bytearray, memoryview)):
         return f"[{len(obj)} bytes removed]"
     if obj is None or isinstance(obj, (bool, int, float)):
         return obj
-    return redact(str(obj), keys, media=media)
+    return _redact(str(obj), forms, media)
 
 
 def strip_secret(obj: Any, secret: str | None) -> Any:
-    """A copy of ``obj`` with every exact occurrence of ``secret`` in its strings (keys too) replaced.
+    """A copy of ``obj`` with every occurrence of ``secret`` in its strings (keys too) replaced.
 
-    For a model's parsed answer (Jev's answers dict): only the exact key is cut, the
-    answer is otherwise kept as the model wrote it. Lists, tuples and dicts are
-    walked without recursion, so a deeply nested answer cannot raise here.
+    For a model's parsed answer (Jev's answers dict): only the key is cut, in each of
+    its :func:`secret_forms`; the answer is otherwise kept as the model wrote it.
+    Lists, tuples and dicts are walked without recursion, so a deeply nested answer
+    cannot raise here.
     """
-    if not secret or len(secret) < 6:
+    if not isinstance(secret, str) or len(secret) < _MIN_SECRET_CHARS:
         return obj
+    forms = secret_forms(secret)
 
     def fix(value: Any) -> Any:
-        return value.replace(secret, REDACTED) if isinstance(value, str) else value
+        if not isinstance(value, str):
+            return value
+        for form in forms:
+            value = value.replace(form, REDACTED)
+        return value
 
     if not isinstance(obj, (dict, list, tuple)):
         return fix(obj)
@@ -125,11 +160,12 @@ def strip_secret(obj: Any, secret: str | None) -> Any:
 
 
 def has_secret(obj: Any, secret: str) -> bool:
-    """True when ``secret`` appears anywhere in ``obj`` (used by tests and the smoke's self-check)."""
+    """True when ``secret`` appears anywhere in ``obj``, in any of its :func:`secret_forms` (used by tests)."""
     if not secret:
         return False
     if isinstance(obj, dict):
         return any(has_secret(k, secret) or has_secret(v, secret) for k, v in obj.items())
     if isinstance(obj, (list, tuple)):
         return any(has_secret(v, secret) for v in obj)
-    return secret in str(obj)
+    text = str(obj)
+    return any(form in text for form in secret_forms(secret))

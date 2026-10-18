@@ -154,7 +154,8 @@ class Recorder:
 
 
 class Server:
-    """A canned HTTP server: each item is (status, body[, headers]), "timeout", or a callable(request)."""
+    """A canned HTTP server: each item is (status, body[, headers]), "timeout" (a read timeout), "drop" (the
+    connection died after the request was sent), "connect" (refused: nothing was sent) or a callable(request)."""
 
     def __init__(self, *items):
         self.items = list(items)
@@ -165,6 +166,8 @@ class Server:
         item = self.items.pop(0) if len(self.items) > 1 else self.items[0]
         if item == "timeout":
             raise httpx.ReadTimeout("timed out", request=request)
+        if item == "drop":
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
         if item == "connect":
             raise httpx.ConnectError("connection refused", request=request)
         if callable(item):
@@ -951,7 +954,9 @@ def _settles(ledger):
 # --------------------------------------------------------------------------- R1: every HTTP attempt is reserved
 def test_r1_lost_attempt_stays_reserved_when_a_retry_answers(ask, ledger, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
-    for first in ("timeout", "connect", (524, "origin timed out")):
+    # O1: a refused connection ("connect") is no longer lost, it settles at $0 (test_o1_*); a connection that
+    # dropped after the request was sent is lost
+    for first in ("timeout", "drop", (524, "origin timed out")):
         before = ledger.spent()
         rec = Recorder()
         server = Server(first, (200, or_response()))
@@ -1054,7 +1059,8 @@ def test_r1_deadline_keeps_a_body_that_already_arrived(ask, ledger, monkeypatch)
 # --------------------------------------------------------------------------- R2: rejected only when nothing was lost
 def test_r2_refusal_after_a_lost_attempt_is_not_rejected_before_generation(ask, ledger, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
-    for first in ("timeout", "connect"):
+    # O1: "connect" then a refusal is rejected before generation now (nothing reached the provider): test_o1_*
+    for first in ("timeout", "drop"):
         before = ledger.spent()
         rec = Recorder()
         server = Server(first, (402, {"error": {"code": 402, "message": "Insufficient credits"}}))
@@ -1222,14 +1228,18 @@ def test_r7_failure_after_the_paid_call_settles_and_traces_before_raising(ask, l
     def broken_cost(*a, **k):
         raise ArithmeticError("cost model broke")
 
+    # G6: a cost that cannot be computed after the paid call used to raise ArithmeticError here (a non-RouterError,
+    # and the paid answer lost). Now the answer is returned at the projection, which stays counted unsettled.
     monkeypatch.setattr(router_core, "settled_cost", broken_cost)
     rec = Recorder()
-    with pytest.raises(ArithmeticError):
-        ask("orm", "cost broke", http=Server((200, or_response())).client(), trace=rec)
+    r = ask("orm", "cost broke", use_cache=False, http=Server((200, or_response())).client(), trace=rec)
     (kind, p), = rec.events
     last = _reserves(ledger)[-1]
-    assert p["ok"] is False and p["usd"] == pytest.approx(last["usd"]) and p["unreconciled_attempts"] == 1
+    assert r.text == '{"green": 5}' and r.usd == pytest.approx(last["usd"]) and r.usd_source == "computed"
+    assert "could not be computed" in r.raw["usd_note"] and "ArithmeticError" in r.raw["usd_note"]
+    assert p["ok"] is True and p["usd"] == pytest.approx(last["usd"]) and p["unreconciled_attempts"] == 1
     assert last["id"] not in {s["id"] for s in _settles(ledger)}  # unknown cost: stays counted at the projection
+    ModelCallPayload.model_validate(p)
 
 
 # --------------------------------------------------------------------------- R8: reasoning budget in the projection
@@ -1507,3 +1517,234 @@ def test_r15_a_key_echoed_in_a_jev_answer_is_scrubbed_from_json_and_cache(ask, c
     assert PLAIN_KEY not in cache.path_for(r.request_hash).read_text(encoding="utf-8")
     hit = ask("jev", "panel", role="system1", extra={"questions": questions})
     assert hit.cache_hit and PLAIN_KEY not in json.dumps(hit.json) and hit.json == r.json
+
+
+# =========================================================================== round 2: one regression test per finding
+# --------------------------------------------------------------------------- G1: a non-2xx cost settles nothing
+def test_g1_a_cost_in_a_failed_body_never_settles_a_lost_attempt(ask, ledger, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+    rec = Recorder()
+    server = Server("timeout", "timeout", (500, {"error": {"message": "upstream exploded"}, "usage": {"cost": 0}}))
+    with pytest.raises(ModelCallError) as err:
+        ask("orm", "lost, lost, 500", http=server.client(), trace=rec)
+    assert len(server.requests) == 3 and err.value.status == 500 and err.value.usd is None
+    reserves = _reserves(ledger)
+    assert len(reserves) == 3 and _settles(ledger) == []  # the 500's "cost 0" settled nothing
+    assert ledger.spent() == pytest.approx(3 * reserves[0]["usd"])
+    p = rec.events[0][1]
+    assert p["ok"] is False and p["unreconciled_attempts"] == 3 and p["usd"] == pytest.approx(3 * reserves[0]["usd"])
+    # a refusal that reports a cost after a lost attempt: the refusal is $0, the lost attempt stays at its projection
+    before = ledger.spent()
+    refused = (402, {"error": {"message": "Insufficient credits"}, "usage": {"cost": 0.5}})
+    with pytest.raises(ModelCallError) as err:
+        ask("orm", "lost then refused", http=Server("timeout", refused).client())
+    assert err.value.usd is None and _settles(ledger)[-1]["usd"] == 0.0
+    assert ledger.spent() - before == pytest.approx(_reserves(ledger)[-2]["usd"])
+    # a 200 whose generation failed still settles its own attempt at the cost it reported (that attempt answered)
+    before = ledger.spent()
+    failed = or_response(finish="error", cost=0.0004, prompt=100, completion=30)
+    with pytest.raises(ModelCallError, match="failed upstream"):
+        ask("orm", "lost then failed generation", http=Server("timeout", (200, failed)).client())
+    assert _settles(ledger)[-1]["id"] == _reserves(ledger)[-1]["id"] and _settles(ledger)[-1]["usd"] == 0.0004
+    assert ledger.spent() - before == pytest.approx(_reserves(ledger)[-2]["usd"] + 0.0004)
+
+
+# --------------------------------------------------------------------------- G2: the floor uses the counts reported
+def test_g2_the_cost_floor_uses_whatever_token_counts_were_reported(ask, ledger, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+    only_prompt = or_response(cost=0.0, prompt=200000)
+    del only_prompt["usage"]["completion_tokens"]
+    r = ask("orm", "x" * 35, max_tokens=1000, http=Server((200, only_prompt)).client())
+    # orm prices 2 / 10: the 200000 input tokens it reported cost $0.40 alone, so its $0 is not trusted; the
+    # output it did not report is taken at the output allowance
+    assert r.usd_source == "computed" and r.usd == pytest.approx((200000 * 2.0 + 1000 * 10.0) / 1e6)
+    assert "below half" in r.raw["usd_note"] and "counted as 0" in r.raw["usd_note"]
+    assert _settles(ledger)[-1]["usd"] == pytest.approx(r.usd)
+    only_completion = or_response(cost=0.0, completion=15000)
+    del only_completion["usage"]["prompt_tokens"]
+    r2 = ask("orm", "x" * 35, max_tokens=16000, http=Server((200, only_completion)).client())
+    assert r2.usd_source == "computed" and r2.usd == pytest.approx((10 * 2.0 + 15000 * 10.0) / 1e6)
+    fair = or_response(cost=0.25, prompt=200000)  # at least half of what its reported counts cost: trusted
+    del fair["usage"]["completion_tokens"]
+    r3 = ask("orm", "y" * 35, max_tokens=1000, http=Server((200, fair)).client())
+    assert r3.usd == 0.25 and r3.usd_source == "provider"
+
+
+# --------------------------------------------------------------------------- G3: the URL sent is the URL checked
+def test_g3_a_url_is_checked_exactly_as_it_will_be_sent(ask, ledger, monkeypatch):
+    monkeypatch.setenv("ELORIAN_API_KEY", PLAIN_KEY)
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+    monkeypatch.setenv("LK_TEST_SYS1_KEY", PLAIN_KEY)
+    server = Server((200, or_response()))
+    cases = (("el", "base_url", "https://elorian.invalid/v1\n", "leading or trailing whitespace"),  # a YAML '|' block
+             ("el", "base_url", " https://elorian.invalid/v1", "leading or trailing whitespace"),
+             ("orm", "base_url", "https://router.invalid/api/v1\t", "leading or trailing whitespace"),
+             ("sys1_vision", "endpoint", "https://decisions.invalid/systemone\r\n", "leading or trailing whitespace"),
+             ("orm", "base_url", "https://router.invalid/api\x07/v1", "control character"),
+             ("orm", "base_url", "https://router.invalid/api/v1​", "control character"),
+             ("orm", "base_url", "https://[api.invalid/v1", "not a valid URL"))  # httpx would send it to %5Bapi.invalid
+    for key, field, url, why in cases:
+        models = _models()
+        setattr(models.models[key], field, url)
+        kw = {"role": "system1", "extra": {"questions": {"q": {"type": "noul", "instructions": "x"}}}} \
+            if key == "sys1_vision" else {}
+        with pytest.raises(ModelNotConfigured, match=why) as err:
+            ask(key, "hi", models=models, http=server.client(), **kw)
+        assert field in str(err.value) and repr(url) in str(err.value)
+    assert not server.requests and ledger.records() == []  # refused before any reservation
+    models = _models()
+    models.models["el"].base_url = "https://elorian.invalid/v1/"
+    ask("el", "hi", models=models, http=server.client())
+    assert str(server.requests[0].url) == "https://elorian.invalid/v1/chat/completions"
+
+
+# --------------------------------------------------------------------------- G4: the key's JSON-escaped form is cut too
+def test_g4_a_key_with_a_quote_or_a_backslash_is_cut_in_its_json_escaped_form(ask, cache, monkeypatch):
+    questions = {"q": {"type": "choice", "instructions": "How many green LEDs?", "criteria": {"5": "five"}}}
+    for odd in ('lk-test-"quote"-' + "Q7" * 12, "lk-test-back\\slash-" + "Q7" * 12):
+        escaped = json.dumps(odd)[1:-1]
+        assert escaped != odd
+        monkeypatch.setenv("TYPESAFE_JEV_API_KEY", odd)
+        answers = {"q": {"choice": "5", "echo": odd, "note": f"seen {odd}"}}
+        server = Server((200, {"id": "r1", "model": "jev-latest", "answers": answers, "usage": {"input_tokens": 10}}))
+        r = ask("jev", f"panel {odd[8:12]}", role="system1", extra={"questions": questions}, http=server.client())
+        record = json.loads(cache.path_for(r.request_hash).read_text(encoding="utf-8"))
+        for text in (r.text, json.dumps(r.json), json.dumps(r.raw), record["text"], json.dumps(record)):
+            assert odd not in text and escaped not in text
+        assert odd not in json.dumps(json.loads(r.text), ensure_ascii=False)  # not even once the text is decoded
+        assert r.text == json.dumps(r.json) and r.json["q"] == {"choice": "5", "echo": "[redacted]",
+                                                                 "note": "seen [redacted]"}
+        hit = ask("jev", f"panel {odd[8:12]}", role="system1", extra={"questions": questions})
+        assert hit.cache_hit and json.loads(hit.text)["q"]["echo"] == "[redacted]"
+    # an answer quoting the key JSON-escaped (a model writing JSON) loses it as well, as do the scrubbing helpers
+    monkeypatch.setenv("OPENROUTER_API_KEY", odd)
+    r = ask("orm", "quote it", http=Server((200, or_response(content='{"echo": "' + escaped + '"}'))).client())
+    assert r.text == '{"echo": "[redacted]"}'
+    from loopkit.router.redact import has_secret, redact, strip_secret
+
+    assert redact(f"x {escaped} y", odd) == "x [redacted] y" and strip_secret([escaped], odd) == ["[redacted]"]
+    assert has_secret({"k": escaped}, odd)
+
+
+# --------------------------------------------------------------------------- G5: no key in response metadata
+def test_g5_a_key_echoed_in_response_metadata_is_cut_everywhere(ask, cache, monkeypatch):
+    for key in (PLAIN_KEY, 'lk-test-"meta"-' + "Q7" * 12):
+        monkeypatch.setenv("OPENROUTER_API_KEY", key)
+        escaped = json.dumps(key)[1:-1]
+        rec = Recorder()
+        body = or_response(gen_id=f"gen-{key}", model=f"vendor/{key}", provider=f"up-{key}", finish=f"stop {escaped}")
+        r = ask("orm", f"meta {key[8:12]}", http=Server((200, body)).client(), trace=rec)
+        record = json.loads(cache.path_for(r.request_hash).read_text(encoding="utf-8"))
+        assert r.model == "vendor/[redacted]" and r.finish_reason == "stop [redacted]"
+        assert record["generation_id"] == "gen-[redacted]" and record["upstream_provider"] == "up-[redacted]"
+        p = rec.events[0][1]
+        assert (p["model"], p["finish_reason"], p["upstream_provider"]) == ("vendor/[redacted]", "stop [redacted]",
+                                                                            "up-[redacted]")
+        for text in (r.model, r.finish_reason, json.dumps(r.raw), json.dumps(rec.events), json.dumps(record)):
+            assert key not in text and escaped not in text
+        # a generation that failed: the error's generation id and details, and its trace event
+        rec = Recorder()
+        failed = or_response(finish=f"error {key}", gen_id=f"gen-{key}", cost=0.0004, prompt=100, completion=30)
+        failed["choices"][0]["error"] = {"message": f"upstream said {key}"}
+        with pytest.raises(ModelCallError) as err:
+            ask("orm", f"fail {key[8:12]}", http=Server((200, failed)).client(), trace=rec)
+        assert err.value.generation_id == "gen-[redacted]"
+        for text in (str(err.value), json.dumps(err.value.raw), json.dumps(rec.events)):
+            assert key not in text and escaped not in text
+
+
+# --------------------------------------------------------------------------- G6: absurd token counts
+def test_g6_a_token_count_that_is_not_a_count_is_treated_as_missing(ask, ledger, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+
+    def body_with(usage):  # the body as text, so a count can be any JSON number
+        body = or_response(cost=None)
+        body["usage"] = usage
+        text = json.dumps(body)
+        return lambda request: httpx.Response(200, content=text.encode())
+
+    rec = Recorder()
+    huge = {"prompt_tokens": 10 ** 400, "completion_tokens": 7, "cost": 0.001}
+    r = ask("orm", "a huge prompt count", http=Server(body_with(huge)).client(), trace=rec)
+    assert r.text == '{"green": 5}' and r.input_tokens is None and r.output_tokens == 7
+    assert r.usd == 0.001 and r.usd_source == "provider" and _settles(ledger)[-1]["usd"] == 0.001
+    assert "input_tokens" in r.raw["usd_note"] and "not a token count" in r.raw["usd_note"]
+    assert rec.events[0][1]["ok"] is True and rec.events[0][1]["input_tokens"] is None
+    ModelCallPayload.model_validate(rec.events[0][1])
+    # every count field; with no cost and nothing left to price, the call stays counted at its projection
+    usage = {"prompt_tokens": 1e13, "completion_tokens": 10 ** 12,
+             "completion_tokens_details": {"reasoning_tokens": 10 ** 30},
+             "prompt_tokens_details": {"cached_tokens": 10 ** 400}}
+    r2 = ask("orm", "every count huge", http=Server(body_with(usage)).client())
+    assert (r2.input_tokens, r2.output_tokens, r2.reasoning_tokens, r2.cached_tokens) == (None, None, None, None)
+    assert r2.usd == pytest.approx(r2.projected_usd) and r2.usd_source == "computed"
+    assert _reserves(ledger)[-1]["id"] not in {s["id"] for s in _settles(ledger)}
+    # a cost too large for a float is no cost: the token counts price the call
+    r3 = ask("orm", "a huge cost", http=Server(body_with({"prompt_tokens": 600, "completion_tokens": 3,
+                                                          "cost": 10 ** 400})).client())
+    assert r3.usd == pytest.approx(0.00123) and r3.usd_source == "computed"
+
+    # after the provider answered, nothing but a RouterError leaves chat(): an answer the adapter cannot read
+    # (its attempt stays counted at its projection), or a failure after the call such as the trace writer's
+    def unreadable(self, *a, **k):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    with monkeypatch.context() as m:
+        m.setattr(OpenRouterAdapter, "_success", unreadable)
+        rec = Recorder()
+        with pytest.raises(ModelCallError, match="could not be read") as err:
+            ask("orm", "unreadable", http=Server((200, or_response())).client(), trace=rec)
+    assert err.value.status == 200 and not err.value.rejected_before_generation and err.value.__cause__ is None
+    assert rec.events[0][1]["ok"] is False and rec.events[0][1]["unreconciled_attempts"] == 1
+    assert _reserves(ledger)[-1]["id"] not in {s["id"] for s in _settles(ledger)}
+
+    class BrokenTrace:
+        def emit(self, kind, payload):
+            raise OSError("trace disk full")
+
+    with pytest.raises(RouterError, match="trace disk full"):
+        ask("orm", "trace broke", http=Server((200, or_response())).client(), trace=BrokenTrace())
+    assert _settles(ledger)[-1]["usd"] == 0.00123  # settled before the trace writer failed
+
+
+# --------------------------------------------------------------------------- O1: no connection costs $0
+def test_o1_an_attempt_that_cannot_connect_settles_at_zero(ask, ledger, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+
+    def connect_timeout(request):
+        raise httpx.ConnectTimeout("timed out while connecting", request=request)
+
+    for failure in ("connect", connect_timeout):
+        rec = Recorder()
+        server = Server(failure)
+        with pytest.raises(ModelCallError) as err:
+            ask("orm", f"no network {failure!r}", max_tokens=16000, http=server.client(), trace=rec)
+        assert len(server.requests) == 3 and err.value.attempts == 3  # still attempts, still retried
+        assert err.value.rejected_before_generation and "nothing reached the provider" in str(err.value)
+        assert [e["outcome"] for e in err.value.raw["attempt_log"]] == ["not_sent"] * 3
+        p = rec.events[0][1]
+        assert (p["attempts"], p["reserved_attempts"], p["unreconciled_attempts"], p["usd"]) == (3, 3, 0, 0.0)
+    assert len(_reserves(ledger)) == 6 and [s["usd"] for s in _settles(ledger)] == [0.0] * 6
+    assert ledger.spent() == 0.0
+    # a blip never fills the cap: each refused connection settles before the next attempt is reserved
+    ledger.set_active_session("T", 0.70)  # 0.30002 per attempt: two lost ones would leave no room for a third
+    server = Server("connect")
+    with pytest.raises(ModelCallError):
+        ask("orm", "x" * 35, max_tokens=30000, http=server.client())
+    assert len(server.requests) == 3 and ledger.spent() == 0.0
+    ledger.set_active_session("T", 1.0)
+    server = Server("connect", (200, or_response()))
+    r = ask("orm", "a blip, then the answer", http=server.client())
+    assert len(server.requests) == 2 and r.usd == 0.00123 and "unreconciled_attempts" not in r.raw
+    assert ledger.spent() == pytest.approx(0.00123)
+    # could not connect, then refused: nothing was generated at all
+    with pytest.raises(ModelCallError) as err:
+        ask("orm", "a blip, then 402", http=Server("connect", (402, {"error": {"message": "no credits"}})).client())
+    assert err.value.rejected_before_generation and ledger.spent() == pytest.approx(0.00123)
+    # a read timeout or a connection dropped after the request was sent is still lost at its projection
+    for lost in ("timeout", "drop"):
+        before = ledger.spent()
+        with pytest.raises(ModelCallError) as err:
+            ask("orm", f"lost {lost}", http=Server(lost).client())
+        assert not err.value.rejected_before_generation
+        assert ledger.spent() - before == pytest.approx(3 * _reserves(ledger)[-1]["usd"])

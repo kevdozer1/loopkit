@@ -15,6 +15,10 @@ S1 schema fixes (each docstring names the defect), and "S1 schema decisions" has
 the tests for each numbered decision of that fix, which is the contract the S3
 interpreter implements: loop bounds, refs only to nodes that have succeeded,
 closed params, error text, strict graph numbers and the JSON Schema export.
+"verifier fixes, round 2" has one block per finding of the independent schema
+verification: linear fence scanning, refs in unions, groups of loops, terminal
+edges, params under an alias key, long ref indexes, bounded suggestion work and
+repair text, and prose braces before the graph.
 """
 
 from __future__ import annotations
@@ -2367,3 +2371,397 @@ def test_task_param_values_are_checked_against_their_schema():
     with pytest.raises(ValidationError, match="grip_force"):
         make_task(params={"slot": 1, "grip_force": "strong"})
     assert make_task(params={"slot": 0}).params == {"slot": 0}
+
+
+# ====================================================== verifier fixes, round 2
+# One block per finding of the independent schema verification. Each docstring names the defect.
+
+# ---- R2.1 a fence followed by a long run of blanks is read in linear time
+@pytest.mark.parametrize("text", [
+    pytest.param("```" + " " * 100_000 + "```", id="spaces_after_a_fence"),
+    pytest.param("```" + "\t" * 100_000 + "x", id="tabs_after_a_fence"),
+    pytest.param("```json" + " \t" * 50_000 + "x", id="blanks_after_a_language_tag"),
+    pytest.param("```" * 40_000, id="backticks_only"),
+    pytest.param("``` " * 25_000 + "\n" + "x" * 100_000, id="fences_on_one_line_never_closed"),
+])
+def test_long_runs_after_a_fence_are_read_in_linear_time(text):
+    """Was: _FENCE_RE had a [ \\t]* group on each side of the language tag and backtracked quadratically, so
+    ``` and 32,000 spaces took about 7 s in validate_graph and in parse_graph. The single pattern
+    ```[^\\n]*\\n(.*?)``` is still quadratic when finditer retries it at each of many fences, so it is matched
+    only at fences found with str.find."""
+    for check in (lambda: validate_graph(text, CATALOG, TASK), lambda: parse_graph(text)[1]):
+        start = time.perf_counter()
+        errs = check()
+        elapsed = time.perf_counter() - start
+        assert [e.code for e in errs] == ["bad_json"]
+        assert elapsed < 0.5, f"{elapsed:.2f} s"
+
+
+def test_fenced_blocks_are_what_the_fence_pattern_finds():
+    from loopkit.schemas.graph import _FENCE_RE, _fenced_blocks
+
+    rng = random.Random(2117)
+    pieces = ["```", "```json", "``", "`", "\n", "\r\n", " ", "\t", "{}", '{"a": 1}', "x", "json"]
+    for _ in range(3000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 14)))
+        assert list(_fenced_blocks(text)) == [m.group(1) for m in _FENCE_RE.finditer(text)], repr(text)
+    t = json.dumps(good_graph())
+    for wrapped in ("```json \r\n" + t + "\r\n```", "``` JSON5 graph:\n" + t + "\n```", "Sure. ```json\n" + t + "```"):
+        assert validate_graph(wrapped, CATALOG, TASK) == [], wrapped[:20]
+
+
+# ---- R2.2 a ref inside a union is typed against a branch that can take it
+_UNION_SKILL = SkillSpec(name="shapes", docstring="Takes unions of containers.", returns=obj({}), params=obj({
+    "either": {"anyOf": [obj({"x": {"type": "string"}}, ("x",)), obj({"x": {"type": "number"}}, ("x",))]},
+    "points": {"anyOf": [{"type": "array", "items": {"type": "number"}}, {"type": "array", "items": VEC3}]},
+}))
+
+
+def _union_errors(params: dict[str, Any]) -> list[GraphError]:
+    g = good_graph()
+    g["nodes"].insert(1, {"id": "use", "skill": "shapes", "params": params})
+    set_edge(g, "locate_box", "success", "use")
+    g["edges"] += [edge("use", "approach_box", "success"), edge("use", "abort", "failure")]
+    return errors_for(g, task=make_task(allowed_skills=TASK.allowed_skills + ["shapes"]),
+                      catalog=CATALOG + [_UNION_SKILL])
+
+
+@pytest.mark.parametrize("params", [
+    pytest.param({"either": {"x": {"ref": "locate_box.yaw"}}}, id="number_fits_the_second_object_branch"),
+    pytest.param({"either": {"x": {"ref": "task.slot"}}}, id="task_integer_fits_the_second_object_branch"),
+    pytest.param({"points": [{"ref": "locate_box.position"}]}, id="point_fits_the_second_array_branch"),
+    pytest.param({"points": [{"ref": "locate_box.yaw"}, 0.5]}, id="numbers_fit_the_first_array_branch"),
+])
+def test_a_ref_in_a_union_is_typed_against_a_branch_that_takes_it(params):
+    """Was: when two container branches of a union both passed with refs as wildcards, every nested ref was
+    typed against the first one, so a ref that fits a later branch got ref_type_mismatch."""
+    assert _union_errors(params) == []
+
+
+@pytest.mark.parametrize("params,words", [
+    pytest.param({"either": {"x": {"ref": "locate_box.found"}}}, ("boolean", "needs string"), id="boolean_object"),
+    pytest.param({"points": [{"ref": "locate_box.found"}]}, ("boolean", "needs number"), id="boolean_array"),
+    pytest.param({"points": [{"ref": "locate_box.position"}, {"ref": "locate_box.yaw"}]}, ("needs number",),
+                 id="no_branch_takes_both_refs"),
+])
+def test_a_ref_that_no_union_branch_takes_is_still_a_mismatch(params, words):
+    errs = _union_errors(params)
+    assert [e.code for e in errs] == ["ref_type_mismatch"]
+    expect_error(errs, "ref_type_mismatch", "use", *words)
+
+
+# ---- R2.3 one error per group of loops, naming every node of the group
+def _two_loops_through_locate() -> dict[str, Any]:
+    """locate_box -> approach_box -(failure)-> locate_box and locate_box -(failure)-> look_again -> locate_box:
+    two loops in one strongly connected component, and no single bound ends both."""
+    g = good_graph()
+    g["nodes"].insert(1, {"id": "look_again", "skill": "approach", "params": {"position": [0.5, 0.0, 0.4]}})
+    set_edge(g, "locate_box", "failure", "look_again")
+    set_edge(g, "approach_box", "failure", "locate_box")
+    g["edges"] += [edge("look_again", "locate_box", "success"), edge("look_again", "abort", "failure")]
+    return g
+
+
+def test_a_group_of_loops_is_reported_with_all_of_its_nodes():
+    """Was: one concrete cycle was reported per strongly connected component, so a writer that bounded a node
+    of that cycle, as the fix said, came back the next round with the component's other loop."""
+    g = _two_loops_through_locate()
+    errs = errors_for(g)
+    assert [e.code for e in errs] == ["unbounded_cycle"]
+    err = expect_error(errs, "unbounded_cycle", "locate_box", "among the nodes locate_box, look_again, approach_box",
+                       "only on a node that every loop runs through and whose failure edge leaves all of the loops",
+                       "no node here is one")
+    example = re.search(r"nodes (.+?) form a loop", err.message).group(1).split(" -> ")  # one concrete loop
+    edges = {(e["src"], e["dst"]) for e in g["edges"]}
+    assert example[0] == example[-1] == "locate_box" and all((a, b) in edges for a, b in zip(example, example[1:]))
+    assert err.fix.startswith("Set max_visits on a node of each loop whose failure edge leaves that loop")
+    node(g, "locate_box")["max_visits"] = 3  # one bound is not enough, as the message says
+    assert [e.code for e in errors_for(g)] == ["unbounded_cycle"]
+    node(g, "look_again")["max_visits"] = 3  # one on each loop, each with a failure edge that leaves its loop
+    assert errors_for(g) == []
+
+
+def test_a_group_of_loops_names_the_node_that_ends_them_all():
+    g = good_graph()
+    set_edge(g, "approach_box", "failure", "locate_box")
+    set_edge(g, "grasp_box", "failure", "locate_box")
+    errs = errors_for(g)
+    expect_error(errs, "unbounded_cycle", "locate_box", "among the nodes locate_box, approach_box, grasp_box",
+                 "here that is 'locate_box'")
+    node(g, "locate_box")["max_visits"] = 3
+    assert errors_for(g) == []
+
+
+def _reduced_adjacency(g: dict[str, Any]) -> dict[str, set[str]]:
+    """The edges a run can take forever: without bounded nodes' success edges and terminal nodes' edges."""
+    bounded = {n["id"] for n in g["nodes"] if n.get("max_visits")}
+    first: dict[tuple[str, str], str] = {}
+    for e in g["edges"]:
+        first.setdefault((e["src"], e["on"]), e["dst"])
+    adj: dict[str, set[str]] = {n["id"]: set() for n in g["nodes"]}
+    for (src, on), dst in first.items():
+        if src not in g["terminal_nodes"] and not (on == "success" and src in bounded):
+            adj[src].add(dst)
+    return adj
+
+
+def _elementary_loops(members: set[str], adj: dict[str, set[str]]) -> list[list[str]]:
+    """Every loop through ``members`` that visits no node twice, each listed once from its smallest node."""
+    loops = []
+    for start in sorted(members):
+        stack = [[start]]
+        while stack:
+            path = stack.pop()
+            for w in adj[path[-1]] & members:
+                if w == start:
+                    loops.append(path)
+                elif w > start and w not in path:
+                    stack.append(path + [w])
+    return loops
+
+
+def _reduced_groups(g: dict[str, Any]) -> list[set[str]]:
+    """Brute force: the groups of loops left once bounded nodes' success edges and terminal nodes' edges go."""
+    adj = _reduced_adjacency(g)
+    reach = {v: _reach(adj, v) for v in adj}
+    groups: list[set[str]] = []
+    for v in adj:
+        if not any(v in grp for grp in groups) and v in reach[v]:
+            groups.append({v} | {w for w in reach[v] if v in reach[w]})
+    return groups
+
+
+def _loop_nodes(message: str) -> set[str]:
+    group = re.search(r"among the nodes (.+?)\. ", message)
+    if group:
+        return set(group.group(1).split(", "))
+    return set(re.search(r"nodes (.+?) form a loop", message).group(1).split(" -> "))
+
+
+def _hub_graph(rng: random.Random) -> dict[str, Any]:
+    """A random graph; half of them have a hub that every loop runs through and whose failure edge leads out
+    (the other nodes point only at later nodes, the hub, done or abort)."""
+    g = _random_graph(rng, rng.randint(2, 7))
+    ids = [n["id"] for n in g["nodes"] if n["skill"] == "release"]
+    if rng.random() < 0.5:
+        rng.shuffle(ids)
+        hub = ids[0]
+        for e in g["edges"]:
+            if e["src"] == hub:
+                e["dst"] = "abort" if e["on"] == "failure" else rng.choice(ids[1:] or ids)
+            else:
+                e["dst"] = rng.choice(ids[ids.index(e["src"]) + 1:] + [hub, hub, "done", "abort"])
+    for n in g["nodes"]:
+        if n["skill"] == "release" and rng.random() < 0.3:
+            n["max_visits"] = 2
+    return g
+
+
+def _ends_the_group(g: dict[str, Any], members: set[str], bound: Iterable[str]) -> bool:
+    trial = json.loads(json.dumps(g))
+    for v in bound:
+        node(trial, v)["max_visits"] = 2
+    return not any(e.code == "unbounded_cycle" and _loop_nodes(e.message) & members
+                   for e in validate_graph(trial, CATALOG, TASK))
+
+
+def test_loop_groups_say_when_one_bound_ends_them_all_as_brute_force_finds():
+    """Each unbounded_cycle names exactly the nodes of one group of loops. Bounding one node of the group ends
+    all of its loops exactly when the message (or, for a single loop, the fix) says so, and the fix for a
+    group (a node of each loop whose failure edge leaves that loop) ends them all."""
+    rng = random.Random(1018)
+    claims = {"single": 0, "ender": 0, "none": 0, "each_loop": 0}
+    for _ in range(1000):
+        g = _hub_graph(rng)
+        errs = [e for e in validate_graph(g, CATALOG, TASK) if e.code == "unbounded_cycle"]
+        named = [_loop_nodes(e.message) for e in errs]
+        assert sorted(map(sorted, named)) == sorted(map(sorted, _reduced_groups(g))), (g, format_errors(errs))
+        fail = {e["src"]: e["dst"] for e in g["edges"] if e["on"] == "failure"}
+        for err, members in zip(errs, named):
+            if "one of several loops" in err.message:
+                picks = set()
+                for loop in _elementary_loops(members, _reduced_adjacency(g)):
+                    fits = [a for a, b in zip(loop, loop[1:] + loop[:1]) if fail.get(a) != b]
+                    picks.add(fits[0] if fits else None)
+                if None not in picks:
+                    assert _ends_the_group(g, members, picks), (picks, g, err.message)
+                    claims["each_loop"] += 1
+            enders = re.search(r"here that is (.+)$", err.message)
+            enders = {x.strip("'") for x in enders.group(1).split(" or ")} if enders else set()
+            for v in members:
+                if node(g, v).get("max_visits"):
+                    continue
+                ended = _ends_the_group(g, members, [v])
+                if "one of several loops" not in err.message:
+                    assert ended == (fail.get(v) not in members), (v, g, err.message)
+                    claims["single"] += 1
+                else:
+                    assert ended == (v in enders), (v, g, err.message)
+                    claims["ender" if ended else "none"] += 1
+    assert min(claims.values()) > 20, claims
+
+
+# ---- R2.4 an edge out of a terminal node is not part of a loop
+def test_an_edge_out_of_a_terminal_node_is_not_a_loop():
+    """Was: an edge out of abort that closed a loop got terminal_has_edges and also an unbounded_cycle, whose
+    max_visits fix could never end it."""
+    g = good_graph()
+    g["edges"].append(edge("abort", "locate_box", "success"))
+    errs = errors_for(g)
+    assert [e.code for e in errs] == ["terminal_has_edges"]
+    expect_error(errs, "terminal_has_edges", "abort", "success")
+
+
+# ---- R2.5 params under an alias key are checked in the same round
+@pytest.mark.parametrize("alias", ["args", "parameters", "inputs", "arguments"])
+def test_params_under_an_alias_key_are_checked_in_the_same_round(alias):
+    """Was: the lenient copy dropped the alias key, so the round that said 'Rename it to "params"' also said
+    the params the writer had given were missing, and never checked their values."""
+    g = good_graph()
+    nd = node(g, "approach_box")
+    nd[alias] = nd.pop("params")
+    errs = validate_graph(json.dumps(g), CATALOG, TASK)
+    assert [e.code for e in errs] == ["bad_shape"]
+    assert expect_error(errs, "bad_shape", "approach_box", alias).fix == 'Rename it to "params"'
+    nd[alias]["standoff"] = 0.5
+    errs = validate_graph(json.dumps(g), CATALOG, TASK)
+    assert [e.code for e in errs] == ["bad_shape", "bad_param"]
+    expect_error(errs, "bad_param", "approach_box", "standoff is 0.5, above the maximum 0.2")
+    nd["inputs" if alias == "args" else "args"] = {"standoff": 0.1}  # two aliases with params: neither is used
+    assert "missing_param" in [e.code for e in validate_graph(json.dumps(g), CATALOG, TASK)]
+
+
+# ---- R2.6 a long item number in a ref path is out of range
+@pytest.mark.parametrize("digits", [10, 400, 4301, 5000])
+def test_a_long_item_number_in_a_ref_is_out_of_range(digits):
+    """Was: an item number of more than about 4300 digits raised ValueError in int(), so the param 'could not
+    be checked'; a 400-digit one got the clear range message."""
+    g = good_graph()
+    node(g, "approach_box")["params"]["yaw"] = {"ref": "locate_box.position." + "9" * digits}
+    errs = errors_for(g)
+    assert [e.code for e in errs] == ["ref_unknown_field"]
+    err = expect_error(errs, "ref_unknown_field", "approach_box", "locate_box.position has at most 3 items, so it "
+                       "has no item 999999999")
+    assert err.fix == "Use an item number from 0 to 2"
+    assert len(err.message) < 300 and ((f"({digits} digits)" in err.message) == (digits > 20))
+
+
+def test_a_long_item_number_into_a_list_of_any_length():
+    task = make_task(params_schema={**TASK.params_schema, "offsets": {"type": "array", "items": {"type": "number"}}},
+                     params={**TASK.params, "offsets": [0.0, 0.01]})
+    g = good_graph()
+    node(g, "approach_slot")["params"]["position"] = [{"ref": "task.offsets." + "9" * 9}, 0.0, 0.1]
+    assert errors_for(g, task=task) == []  # nine digits is an item number like any other
+    node(g, "approach_slot")["params"]["position"] = [{"ref": "task.offsets." + "9" * 5000}, 0.0, 0.1]
+    err = expect_error(errors_for(g, task=task), "ref_unknown_field", "approach_slot",
+                       "task.offsets has no item 999999999... (5000 digits): an item number has at most 9 digits")
+    assert err.fix == "Use an item number, for example task.offsets.0"
+
+
+# ---- R2.7 bounded suggestion work and repair text
+def _unknown_ref_chain(n: int, pad: str = "") -> dict[str, Any]:
+    """n nodes in a line, each reading the node before it under a misspelled id (a q appended)."""
+    ids = [f"s{pad}{i}" for i in range(n)]
+    nodes = [{"id": ids[0], "skill": "locate", "params": {"target": "box"}}]
+    nodes += [{"id": ids[i], "skill": "grasp", "params": {"width_mm": {"ref": f"{ids[i - 1]}q.width_mm"}}}
+              for i in range(1, n)]
+    nodes += [{"id": "done", "skill": "done"}, {"id": "abort", "skill": "abort", "params": {"reason": "x"}}]
+    edges = []
+    for i in range(n):
+        edges += [edge(ids[i], ids[i + 1] if i + 1 < n else "done", "success"), edge(ids[i], "abort", "failure")]
+    return {"nodes": nodes, "edges": edges, "entry": ids[0], "terminal_nodes": ["done", "abort"]}
+
+
+def test_unknown_node_fix_lists_the_five_closest_ids():
+    """Was: every ref_unknown_node fix listed every node id."""
+    g = _unknown_ref_chain(30)
+    errs = errors_for(g)
+    assert [e.code for e in errs] == ["ref_unknown_node"] * 29
+    err = expect_error(errs, "ref_unknown_node", "s8", "'s7q'")
+    assert err.fix.startswith("Did you mean 's7'? The node ids closest to it: s7, ")
+    assert len(err.fix.split(": ", 1)[1].split(", ")) == 5
+    small = good_graph()
+    small["nodes"] = [n for n in small["nodes"] if n["id"] in ("locate_box", "approach_box", "done", "abort")]
+    small["edges"] = [edge("locate_box", "approach_box", "success"), edge("locate_box", "abort", "failure"),
+                      edge("approach_box", "done", "success"), edge("approach_box", "abort", "failure")]
+    node(small, "approach_box")["params"]["position"] = {"ref": "locate_bx.position"}
+    err = expect_error(errors_for(small), "ref_unknown_node", "approach_box")
+    assert err.fix == "Did you mean 'locate_box'? Use one of: abort, approach_box, done, locate_box"
+
+
+def test_unknown_node_suggestions_are_worked_out_once_per_name():
+    """Was: the closest ids were worked out again for every ref to the same unknown node. Suggestion work is
+    bounded per run, so without the memo the later refs here would get the cheap guess instead."""
+    g = _chain(300)
+    for n in g["nodes"][1:300]:
+        n["params"]["width_mm"] = {"ref": "n0x.width_mm"}
+    errs = validate_graph(g, CATALOG, TASK)
+    assert [e.code for e in errs] == ["ref_unknown_node"] * 299
+    assert {e.fix for e in errs} == {errs[0].fix} and errs[0].fix.startswith("Did you mean 'n0'? ")
+
+
+def test_many_distinct_unknown_refs_validate_quickly_with_short_repair_text():
+    """Was: a 126 KB reply with 299 refs to distinct unknown nodes took about 30 s and made about 5 MB of fix
+    text (each fix listed all 302 ids); format_errors returned all of it to the writer."""
+    text = json.dumps(_unknown_ref_chain(300, pad="x" * 50))
+    assert len(text) > 120_000
+    start = time.perf_counter()
+    errs = validate_graph(text, CATALOG, TASK)
+    elapsed = time.perf_counter() - start
+    assert [e.code for e in errs] == ["ref_unknown_node"] * 299
+    assert elapsed < 5, f"{elapsed:.1f} s"
+    assert errs[0].fix.startswith(f"Did you mean 's{'x' * 50}0'? ") and max(len(e.fix) for e in errs) < 400
+    late = expect_error(errs, "ref_unknown_node", f"s{'x' * 50}201")  # past the comparison budget
+    assert late.fix.startswith(f"Node ids that start most like it: s{'x' * 50}200, ")
+    repair = format_errors(errs)
+    assert len(repair) <= 12_000 and repair.startswith("1. [ref_unknown_node]")
+    last = repair.splitlines()[-1]
+    listed = len(repair.splitlines()) - 1
+    assert last == f"{299 - listed} more errors not listed. Fix these, and the same mistake anywhere else in the graph"
+
+
+def test_format_errors_caps_the_count_and_the_size_of_the_list():
+    many = [GraphError("bad_param", f"n{i}", f"problem {i}", "fix it") for i in range(100)]
+    lines = format_errors(many).splitlines()
+    assert len(lines) == 41 and lines[39].startswith("40. [bad_param] node 'n39'")
+    assert lines[40].startswith("60 more errors not listed")
+    assert format_errors(many[:40]).count("\n") == 39  # nothing is left out, so no extra line
+    huge = GraphError("ref_unknown_node", "go", "x" * 1_000_000, "Did you mean 'find'?")
+    text = format_errors([huge] + many)
+    first = text.splitlines()[0]
+    assert len(text) <= 12_000 and len(first) <= 2_000 and "[...]" in first
+    assert first.startswith("1. [ref_unknown_node] node 'go': xxx") and first.endswith("Fix: Did you mean 'find'?")
+    wide = [GraphError("bad_shape", None, "y" * 1_500, "Follow the graph format") for _ in range(30)]
+    text = format_errors(wide)
+    assert len(text) <= 12_000 and text.endswith(GRAPH_FORMAT_HINT) and text.count(GRAPH_FORMAT_HINT) == 1
+    assert re.search(r"\n(\d+) more errors not listed", text) and text.count("\n") < 30
+    six = format_errors([GraphError("bad_param", "n", "z" * 50_000, "fix")] * 6)  # five 2,000-character lines fit
+    assert len(six) <= 12_000 and six.count("\n") == 5
+    assert six.endswith("1 more error not listed. Fix these, and the same mistake anywhere else in the graph")
+
+
+# ---- R2.8 prose with braces before the graph
+@pytest.mark.parametrize("prose", [
+    "Use {curly} braces. ",
+    "Here is {the plan} and {the graph}:\n",
+    "Params look like { this }.\n",
+])
+def test_braces_in_prose_before_the_graph(prose):
+    """Was: _load_json tried raw_decode only at the first "{", so prose with a brace in it before the graph
+    gave bad_json."""
+    text = prose + json.dumps(good_graph(), indent=1)
+    assert validate_graph(text, CATALOG, TASK) == []
+    graph, errs = parse_graph(text)
+    assert errs == [] and graph == ProgramGraph.model_validate(good_graph())
+
+
+def test_broken_json_after_prose_braces_is_still_bad_json():
+    t = json.dumps(good_graph())
+    err = validate_graph("Use {curly} braces. " + t[:-12], CATALOG, TASK)[0]  # the graph is cut off
+    assert err.code == "bad_json" and err.fix.endswith("If your reply was cut off, return a shorter graph")
+    newline = t.replace('"could not seat the box"', '"could not\nseat the box"')  # a raw newline in a string
+    errs = validate_graph(newline, CATALOG, TASK)
+    assert [e.code for e in errs] == ["bad_json"] and "Invalid control character" in errs[0].message
+    assert [e.code for e in validate_graph(str(good_graph()), CATALOG, TASK)] == ["bad_json"]  # holds "params": {}
+    assert validate_graph("{x} " * 49 + t, CATALOG, TASK) == []  # the 50th "{" is still tried
+    assert [e.code for e in validate_graph("{x} " * 50 + t, CATALOG, TASK)] == ["bad_json"]  # the 51st is not
