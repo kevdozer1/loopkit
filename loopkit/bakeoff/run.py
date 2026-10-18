@@ -252,7 +252,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--log", default=None, help="log file (default: <out>/run.log; '-' for stdout only)")
     ap.add_argument("--train-seeds", default=None, help="override, e.g. 1000-1002 (smoke runs only)")
-    ap.add_argument("--heldout-seeds", default=None, help="override, e.g. 2000-2004 (smoke runs only)")
+    ap.add_argument("--heldout-seeds", default=None,
+                    help="override for smoke runs, with dev seeds such as 600-619 (never 2000-2019 before the bake-off)")
     ap.add_argument("--session-cap", type=float, default=None, help="override the session cap (default: total_cap_usd)")
     ap.add_argument("--no-report", action="store_true")
     args = ap.parse_args(argv)
