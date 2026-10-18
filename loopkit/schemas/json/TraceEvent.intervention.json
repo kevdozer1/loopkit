@@ -1,0 +1,19 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "actor": {
+      "default": "human",
+      "title": "Actor",
+      "type": "string"
+    },
+    "reason": {
+      "title": "Reason",
+      "type": "string"
+    }
+  },
+  "required": [
+    "reason"
+  ],
+  "title": "InterventionPayload",
+  "type": "object"
+}

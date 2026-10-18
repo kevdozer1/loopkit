@@ -1,0 +1,47 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "error": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error"
+    },
+    "node_id": {
+      "title": "Node Id",
+      "type": "string"
+    },
+    "ok": {
+      "title": "Ok",
+      "type": "boolean"
+    },
+    "outputs": {
+      "additionalProperties": true,
+      "title": "Outputs",
+      "type": "object"
+    },
+    "sim_seconds": {
+      "minimum": 0,
+      "title": "Sim Seconds",
+      "type": "number"
+    },
+    "skill": {
+      "title": "Skill",
+      "type": "string"
+    }
+  },
+  "required": [
+    "node_id",
+    "skill",
+    "ok",
+    "sim_seconds"
+  ],
+  "title": "NodeEndPayload",
+  "type": "object"
+}

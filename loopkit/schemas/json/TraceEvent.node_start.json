@@ -1,0 +1,29 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "attempt": {
+      "default": 0,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "node_id": {
+      "title": "Node Id",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "title": "Params",
+      "type": "object"
+    },
+    "skill": {
+      "title": "Skill",
+      "type": "string"
+    }
+  },
+  "required": [
+    "node_id",
+    "skill"
+  ],
+  "title": "NodeStartPayload",
+  "type": "object"
+}

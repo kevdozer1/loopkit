@@ -73,10 +73,16 @@ def cache_dir(create: bool = True) -> Path:
 
 
 def run_dir(run_id: str, create: bool = True) -> Path:
-    """``LOOPKIT_DATA/runs/<run_id>``: one directory per traced run."""
-    if not run_id or any(c in run_id for c in '\\/:*?"<>|'):
-        raise ValueError(f"run_id {run_id!r} is not a plain directory name")
-    path = runs_dir(create) / run_id
+    """``LOOPKIT_DATA/runs/<run_id>``: one directory per traced run.
+
+    The run id rule is TraceWriter's: ``loopkit.traces.check_run_id`` (no
+    ``.jsonl`` suffix, no Windows device name, ...), and the path must resolve to
+    a direct child of the runs folder. ValueError otherwise.
+    """
+    from .traces.writer import check_run_id, run_path_under  # here, not at the top: loopkit.traces imports paths
+
+    check_run_id(run_id)  # before anything is created
+    path = run_path_under(runs_dir(create), run_id)
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path

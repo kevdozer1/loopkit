@@ -1,0 +1,311 @@
+{
+  "$defs": {
+    "CameraExtrinsics": {
+      "additionalProperties": false,
+      "description": "Camera pose in the robot base frame. ``rotation`` columns are the camera's\nx (right), y (down) and z (forward, optical axis) axes in base coordinates.",
+      "properties": {
+        "position": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Position",
+          "type": "array"
+        },
+        "rotation": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "maxItems": 3,
+              "minItems": 3,
+              "prefixItems": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "maxItems": 3,
+              "minItems": 3,
+              "prefixItems": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array"
+            },
+            {
+              "maxItems": 3,
+              "minItems": 3,
+              "prefixItems": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array"
+            }
+          ],
+          "title": "Rotation",
+          "type": "array"
+        }
+      },
+      "required": [
+        "position",
+        "rotation"
+      ],
+      "title": "CameraExtrinsics",
+      "type": "object"
+    },
+    "CameraImage": {
+      "additionalProperties": false,
+      "description": "One camera's frame. Equal when every field matches and the pixels are equal (np.array_equal).",
+      "properties": {
+        "extrinsics": {
+          "$ref": "#/$defs/CameraExtrinsics"
+        },
+        "intrinsics": {
+          "$ref": "#/$defs/CameraIntrinsics"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        }
+      },
+      "required": [
+        "name",
+        "intrinsics",
+        "extrinsics"
+      ],
+      "title": "CameraImage",
+      "type": "object"
+    },
+    "CameraIntrinsics": {
+      "additionalProperties": false,
+      "description": "Pinhole intrinsics in pixels (OpenCV convention).",
+      "properties": {
+        "cx": {
+          "title": "Cx",
+          "type": "number"
+        },
+        "cy": {
+          "title": "Cy",
+          "type": "number"
+        },
+        "fovy_deg": {
+          "title": "Fovy Deg",
+          "type": "number"
+        },
+        "fx": {
+          "title": "Fx",
+          "type": "number"
+        },
+        "fy": {
+          "title": "Fy",
+          "type": "number"
+        },
+        "height": {
+          "title": "Height",
+          "type": "integer"
+        },
+        "width": {
+          "title": "Width",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "width",
+        "height",
+        "fx",
+        "fy",
+        "cx",
+        "cy",
+        "fovy_deg"
+      ],
+      "title": "CameraIntrinsics",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "What a skill sees. Each key of ``cameras`` is that camera's name.",
+  "properties": {
+    "cameras": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CameraImage"
+      },
+      "title": "Cameras",
+      "type": "object"
+    },
+    "gripper_force": {
+      "description": "Grip force estimate from the gripper actuator, N",
+      "title": "Gripper Force",
+      "type": "number"
+    },
+    "gripper_width": {
+      "description": "Distance between the finger pads, m",
+      "title": "Gripper Width",
+      "type": "number"
+    },
+    "joint_positions": {
+      "items": {
+        "type": "number"
+      },
+      "title": "Joint Positions",
+      "type": "array"
+    },
+    "joint_velocities": {
+      "items": {
+        "type": "number"
+      },
+      "title": "Joint Velocities",
+      "type": "array"
+    },
+    "sim_time": {
+      "title": "Sim Time",
+      "type": "number"
+    },
+    "tcp_position": {
+      "description": "Tool centre point from forward kinematics, base frame, m",
+      "maxItems": 3,
+      "minItems": 3,
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "title": "Tcp Position",
+      "type": "array"
+    },
+    "tcp_rotation": {
+      "description": "Tool frame axes (columns) from forward kinematics, base frame",
+      "maxItems": 3,
+      "minItems": 3,
+      "prefixItems": [
+        {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "type": "array"
+        },
+        {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "type": "array"
+        },
+        {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "type": "array"
+        }
+      ],
+      "title": "Tcp Rotation",
+      "type": "array"
+    },
+    "wrench_estimate": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "External force (N) and torque (Nm) at the hand estimated from joint torques",
+      "title": "Wrench Estimate"
+    }
+  },
+  "required": [
+    "cameras",
+    "joint_positions",
+    "joint_velocities",
+    "gripper_width",
+    "gripper_force",
+    "tcp_position",
+    "tcp_rotation",
+    "sim_time"
+  ],
+  "title": "Observation",
+  "type": "object"
+}

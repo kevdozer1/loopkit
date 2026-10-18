@@ -1,0 +1,99 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "cache_hit": {
+      "title": "Cache Hit",
+      "type": "boolean"
+    },
+    "input_tokens": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Input Tokens"
+    },
+    "latency_ms": {
+      "minimum": 0,
+      "title": "Latency Ms",
+      "type": "number"
+    },
+    "model": {
+      "title": "Model",
+      "type": "string"
+    },
+    "output_tokens": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Output Tokens"
+    },
+    "provider": {
+      "title": "Provider",
+      "type": "string"
+    },
+    "reasoning_tokens": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Reasoning Tokens"
+    },
+    "request_hash": {
+      "title": "Request Hash",
+      "type": "string"
+    },
+    "role": {
+      "enum": [
+        "writer",
+        "reader",
+        "system1"
+      ],
+      "title": "Role",
+      "type": "string"
+    },
+    "usd": {
+      "minimum": 0,
+      "title": "Usd",
+      "type": "number"
+    },
+    "usd_source": {
+      "enum": [
+        "provider",
+        "computed"
+      ],
+      "title": "Usd Source",
+      "type": "string"
+    }
+  },
+  "required": [
+    "provider",
+    "model",
+    "role",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "usd",
+    "usd_source",
+    "latency_ms",
+    "cache_hit",
+    "request_hash"
+  ],
+  "title": "ModelCallPayload",
+  "type": "object"
+}

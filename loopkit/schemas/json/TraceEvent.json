@@ -1,0 +1,460 @@
+{
+  "additionalProperties": false,
+  "description": "One trace line. ``payload`` follows the model for ``kind`` (the JSON Schema lists one\nbranch per kind); extra payload fields are kept.",
+  "oneOf": [
+    {
+      "properties": {
+        "kind": {
+          "const": "model_call"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "properties": {
+            "cache_hit": {
+              "title": "Cache Hit",
+              "type": "boolean"
+            },
+            "input_tokens": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Input Tokens"
+            },
+            "latency_ms": {
+              "minimum": 0,
+              "title": "Latency Ms",
+              "type": "number"
+            },
+            "model": {
+              "title": "Model",
+              "type": "string"
+            },
+            "output_tokens": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Output Tokens"
+            },
+            "provider": {
+              "title": "Provider",
+              "type": "string"
+            },
+            "reasoning_tokens": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Reasoning Tokens"
+            },
+            "request_hash": {
+              "title": "Request Hash",
+              "type": "string"
+            },
+            "role": {
+              "enum": [
+                "writer",
+                "reader",
+                "system1"
+              ],
+              "title": "Role",
+              "type": "string"
+            },
+            "usd": {
+              "minimum": 0,
+              "title": "Usd",
+              "type": "number"
+            },
+            "usd_source": {
+              "enum": [
+                "provider",
+                "computed"
+              ],
+              "title": "Usd Source",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model",
+            "role",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "usd",
+            "usd_source",
+            "latency_ms",
+            "cache_hit",
+            "request_hash"
+          ],
+          "title": "ModelCallPayload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "node_start"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "properties": {
+            "attempt": {
+              "default": 0,
+              "title": "Attempt",
+              "type": "integer"
+            },
+            "node_id": {
+              "title": "Node Id",
+              "type": "string"
+            },
+            "params": {
+              "additionalProperties": true,
+              "title": "Params",
+              "type": "object"
+            },
+            "skill": {
+              "title": "Skill",
+              "type": "string"
+            }
+          },
+          "required": [
+            "node_id",
+            "skill"
+          ],
+          "title": "NodeStartPayload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "node_end"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Error"
+            },
+            "node_id": {
+              "title": "Node Id",
+              "type": "string"
+            },
+            "ok": {
+              "title": "Ok",
+              "type": "boolean"
+            },
+            "outputs": {
+              "additionalProperties": true,
+              "title": "Outputs",
+              "type": "object"
+            },
+            "sim_seconds": {
+              "minimum": 0,
+              "title": "Sim Seconds",
+              "type": "number"
+            },
+            "skill": {
+              "title": "Skill",
+              "type": "string"
+            }
+          },
+          "required": [
+            "node_id",
+            "skill",
+            "ok",
+            "sim_seconds"
+          ],
+          "title": "NodeEndPayload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "verdict"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "description": "A Verdict, flattened: evidence.metrics and evidence.image_paths sit at the top level (a\nVerdict-shaped payload is flattened on the way in; top-level keys win). The Verdict rules hold:\na passed verdict has score 1, no failure_class and no failing_node; a failed one has a\nfailure_class and a score below 1.",
+          "properties": {
+            "failing_node": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Failing Node"
+            },
+            "failure_class": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "perception",
+                    "grasp",
+                    "alignment",
+                    "stopping",
+                    "timeout",
+                    "safety",
+                    "other"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Failure Class"
+            },
+            "image_paths": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Image Paths",
+              "type": "array"
+            },
+            "metrics": {
+              "additionalProperties": true,
+              "title": "Metrics",
+              "type": "object"
+            },
+            "passed": {
+              "title": "Passed",
+              "type": "boolean"
+            },
+            "score": {
+              "maximum": 1,
+              "minimum": 0,
+              "title": "Score",
+              "type": "number"
+            }
+          },
+          "required": [
+            "passed",
+            "score"
+          ],
+          "title": "VerdictPayload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "patch"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "properties": {
+            "failure_summary": {
+              "title": "Failure Summary",
+              "type": "string"
+            },
+            "graph_after_hash": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Graph After Hash"
+            },
+            "graph_before_hash": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Graph Before Hash"
+            },
+            "round": {
+              "minimum": 0,
+              "title": "Round",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "round",
+            "graph_before_hash",
+            "graph_after_hash",
+            "failure_summary"
+          ],
+          "title": "PatchPayload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "intervention"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "properties": {
+            "actor": {
+              "default": "human",
+              "title": "Actor",
+              "type": "string"
+            },
+            "reason": {
+              "title": "Reason",
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason"
+          ],
+          "title": "InterventionPayload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ]
+    },
+    {
+      "properties": {
+        "kind": {
+          "const": "budget_stop"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "properties": {
+            "cap_usd": {
+              "title": "Cap Usd",
+              "type": "number"
+            },
+            "reason": {
+              "title": "Reason",
+              "type": "string"
+            },
+            "scope": {
+              "title": "Scope",
+              "type": "string"
+            },
+            "spent_usd": {
+              "title": "Spent Usd",
+              "type": "number"
+            }
+          },
+          "required": [
+            "scope",
+            "cap_usd",
+            "spent_usd",
+            "reason"
+          ],
+          "title": "BudgetStopPayload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "kind",
+        "payload"
+      ]
+    }
+  ],
+  "properties": {
+    "kind": {
+      "enum": [
+        "model_call",
+        "node_start",
+        "node_end",
+        "verdict",
+        "patch",
+        "intervention",
+        "budget_stop"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "seq": {
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "ts": {
+      "description": "Unix time, seconds",
+      "title": "Ts",
+      "type": "number"
+    }
+  },
+  "required": [
+    "run_id",
+    "ts",
+    "seq",
+    "kind",
+    "payload"
+  ],
+  "title": "TraceEvent",
+  "type": "object"
+}

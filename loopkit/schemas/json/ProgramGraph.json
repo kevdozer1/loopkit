@@ -1,0 +1,164 @@
+{
+  "$defs": {
+    "Edge": {
+      "additionalProperties": false,
+      "description": "After ``src`` finishes with outcome ``on``, ``dst`` runs next.",
+      "properties": {
+        "dst": {
+          "description": "The id of the node that runs next",
+          "title": "Dst",
+          "type": "string"
+        },
+        "on": {
+          "description": "The outcome of src that takes this edge. Every non-terminal node has one success edge and one failure edge",
+          "enum": [
+            "success",
+            "failure"
+          ],
+          "title": "On",
+          "type": "string"
+        },
+        "src": {
+          "description": "The id of the node this edge leaves",
+          "title": "Src",
+          "type": "string"
+        }
+      },
+      "required": [
+        "src",
+        "dst",
+        "on"
+      ],
+      "title": "Edge",
+      "type": "object"
+    },
+    "Node": {
+      "additionalProperties": false,
+      "description": "One skill call.",
+      "properties": {
+        "id": {
+          "description": "Unique node id: a letter, then letters, digits, '_' or '-', at most 64 characters",
+          "title": "Id",
+          "type": "string"
+        },
+        "max_retries": {
+          "anyOf": [
+            {
+              "maximum": 10,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "In-place retries: a failed node runs again up to this many times before its failure edge is taken. Overrides the graph's max_retries",
+          "title": "Max Retries"
+        },
+        "max_visits": {
+          "anyOf": [
+            {
+              "maximum": 50,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Loop bound: a node visited more than max_visits times fails without running and takes its failure edge. A loop through edges ends only at a node with max_visits whose failure edge leaves the loop",
+          "title": "Max Visits"
+        },
+        "params": {
+          "additionalProperties": true,
+          "description": "The skill's params. Each value is a literal or {\"ref\": \"<node_id>.<field>\"}, an output of a node that succeeds on every path to this one, or {\"ref\": \"task.<param>\"}",
+          "title": "Params",
+          "type": "object"
+        },
+        "skill": {
+          "description": "The name of a skill in the catalog",
+          "title": "Skill",
+          "type": "string"
+        },
+        "timeout_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds the node may run before it fails",
+          "title": "Timeout S"
+        }
+      },
+      "required": [
+        "id",
+        "skill"
+      ],
+      "title": "Node",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A robot task program: skill calls joined by success and failure edges, run from ``entry`` until a\ndone or abort node. A node visited more than its max_visits fails without running and takes its failure\nedge; a node's outputs can be read only by nodes that run after it has succeeded.",
+  "properties": {
+    "edges": {
+      "description": "One success edge and one failure edge per non-terminal node",
+      "items": {
+        "$ref": "#/$defs/Edge"
+      },
+      "title": "Edges",
+      "type": "array"
+    },
+    "entry": {
+      "description": "The id of the first node to run",
+      "title": "Entry",
+      "type": "string"
+    },
+    "max_retries": {
+      "anyOf": [
+        {
+          "maximum": 10,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": 1,
+      "description": "Default in-place retries for every node (a node's own max_retries overrides it). null means 1",
+      "title": "Max Retries"
+    },
+    "nodes": {
+      "description": "The skill calls",
+      "items": {
+        "$ref": "#/$defs/Node"
+      },
+      "title": "Nodes",
+      "type": "array"
+    },
+    "terminal_nodes": {
+      "description": "The ids of the done and abort nodes. A terminal node ends the program and has no edges",
+      "items": {
+        "type": "string"
+      },
+      "title": "Terminal Nodes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "nodes",
+    "edges",
+    "entry",
+    "terminal_nodes"
+  ],
+  "title": "ProgramGraph",
+  "type": "object"
+}

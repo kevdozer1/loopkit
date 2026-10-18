@@ -19,11 +19,12 @@ models:
     direct: {adapter: anthropic, id: claude-opus-5-5}
     price_in: 4.00
     price_out: 20.00
+    cached_in: 0.20
     vision: true
     roles: [writer, reader]
     verified: true
-    source: robolabel prices.yaml, OpenRouter catalogue
-    accessed: "2026-09-27"
+    source: OpenRouter catalogue (GET /api/v1/models) read 2026-10-18T00:41Z, unchanged from robolabel's 2026-09-27 read
+    accessed: "2026-10-17"
 
   astra:
     display: GPT-6 Astra
@@ -31,63 +32,78 @@ models:
     id: openai/gpt-6-astra
     price_in: 10.00
     price_out: 50.00
+    cached_in: 1.00
     vision: true
     roles: [writer, reader]
     verified: true
-    source: robolabel prices.yaml, OpenRouter catalogue
-    accessed: "2026-09-27"
+    source: OpenRouter catalogue (GET /api/v1/models) read 2026-10-18T00:41Z, unchanged from robolabel's 2026-09-27 read
+    accessed: "2026-10-17"
 
   sol:
     display: GPT-6.1 Sol
     adapter: openrouter
     id: openai/gpt-6.1-sol
-    fallback_id: openai/gpt-6-sol   # verified at 2.00 / 10.00 on 2026-09-27
+    fallback_id: openai/gpt-6-sol   # also listed at 2.00 / 10.00 on 2026-10-18
     price_in: 2.00
     price_out: 10.00
+    cached_in: 0.10
     vision: true
     roles: [writer, reader]
-    verified: false
-    source: GPT-6 Sol price from robolabel. Confirm the 6.1 id and price. Elorian's launch post puts Glimpse 70% below Sol, which fits 2.00 / 10.00
-    accessed: null
+    verified: true
+    source: OpenRouter catalogue (GET /api/v1/models) read 2026-10-18T00:41Z. Input text, image and file
+    accessed: "2026-10-17"
 
   argon:
     display: Gemini 4 Argon
     adapter: openrouter
     id: google/gemini-4-argon
     direct: {adapter: gemini, id: null}
-    price_in: null
-    price_out: null
+    price_in: 2.00
+    price_out: 10.00
+    cached_in: 0.10
     vision: true
     roles: [writer, reader]
-    verified: false
-    source: id is a guess. Look it up
-    accessed: null
+    verified: true
+    source: OpenRouter catalogue (GET /api/v1/models) read 2026-10-18T00:41Z. The catalogue also lists an image price of 0.000002 USD per image
+    accessed: "2026-10-17"
 
   glimpse:
     display: Elorian Glimpse
     adapter: elorian
-    id: null              # read from platform.elorian.ai docs
-    base_url: null        # if the API is OpenAI-compatible, reuse the OpenAI-style adapter with this base_url
+    id: elorian-1           # the plain model (snapshot elorian-1-2026-09-15). elorian-1-agent adds hosted Python and web search, not used here
+    base_url: https://api.elorian.ai/v1
+    alt_route: {adapter: openrouter, id: elorian/glimpse}   # used when ELORIAN_API_KEY is empty and OPENROUTER_API_KEY is set
     env_key: ELORIAN_API_KEY
     price_in: 0.60
     price_out: 3.00
+    cached_in: 0.06
     vision: true
     roles: [reader, writer]
-    verified: false
-    source: Elorian launch post (https://elorian.ai/blog/introducing-glimpse) and FourWeekMBA coverage, Oct 16 2026
+    verified: true
+    source: >-
+      Id, base URL and request format from the docs embedded in platform.elorian.ai's public client, read 2026-10-17:
+      OpenAI-compatible POST /v1/chat/completions, Bearer key (elor_sk_...), default_model elorian-1,
+      reasoning_effort one of low, medium, xhigh (xhigh is the default), max_completion_tokens (8000 recommended),
+      no cost field in usage. Price from the launch post (https://elorian.ai/blog/introducing-glimpse) and the
+      OpenRouter catalogue entry elorian/glimpse (0.60 / 3.00, cache read 0.06) read 2026-10-18T00:41Z.
+      The live /v1/models list needs a key and was not read
     accessed: "2026-10-17"
 
   cheap_open:
-    display: cheapest open-weights vision model on OpenRouter
+    display: Nex N2.5 mini (cheapest open-weights vision model on OpenRouter)
     adapter: openrouter
-    id: null              # S1 picks it: open weights, accepts images, supports JSON output. Record why
-    price_in: null
-    price_out: null
+    id: nex-agi/nex-n2.5-mini
+    price_in: 0.025
+    price_out: 0.10
     vision: true
     roles: [writer, reader]
-    verified: false
-    source: null
-    accessed: null
+    verified: true
+    source: >-
+      OpenRouter catalogue read 2026-10-18T00:41Z. Chosen as the cheapest paid model with open weights (a Hugging Face
+      id, nex-agi/Nex-N2.5-mini), image input, JSON output (structured_outputs) and a 262k context. Excluded :free
+      variants (rate limited, unsuitable for an overnight run) and :batch variants (asynchronous). Next cheapest:
+      google/gemma-3-4b-it (0.05 / 0.10), deepseek/deepseek-v4.1-flash (0.0552 / 0.144), z-ai/glm-5.3-flash (0.048 / 0.20)
+    accessed: "2026-10-17"
 
   luna:
     display: GPT-6 Luna (optional cheap closed baseline)
@@ -95,23 +111,31 @@ models:
     id: openai/gpt-6-luna
     price_in: 0.10
     price_out: 0.50
+    cached_in: 0.01
     vision: true
     roles: [reader, writer]
     verified: true
-    source: robolabel prices.yaml, OpenRouter catalogue
-    accessed: "2026-09-27"
+    source: OpenRouter catalogue (GET /api/v1/models) read 2026-10-18T00:41Z, unchanged from robolabel's 2026-09-27 read
+    accessed: "2026-10-17"
 
   d1:
     display: Liquid d1
-    adapter: openrouter
-    id: null              # find the Liquid d1 id on OpenRouter. Text only there
+    adapter: jev            # the System One decisions protocol, the same request shape as Jev
+    id: d1
+    endpoint: https://api.liquid.ai/decisions/v1/systemone
+    env_key: LIQUID_API_KEY
     price_in: 0.04
-    price_out: null
-    vision: false
+    price_out: 0.0
+    vision: true
     roles: [system1]
-    verified: false
-    source: Liquid AI blog (https://www.liquid.ai/blog/d1-decision-model), Oct 5 2026
-    accessed: "2026-10-16"
+    verified: true
+    source: >-
+      Liquid AI blog (https://www.liquid.ai/blog/d1-decision-model) read 2026-10-17: model d1 at
+      https://api.liquid.ai/decisions/v1/systemone (body: model, optional images as base64 data URLs, state, questions),
+      billed on input tokens only at 0.04 per million, images at 1.5 tokens per 32x32 patch, each question billed as its
+      own prompt. OpenRouter lists liquid/d1 and liquid/d1-ultra on its Liquid provider page (text only there) but not in
+      the chat-completions catalogue
+    accessed: "2026-10-17"
 
   jev:
     display: Typesafe Jev

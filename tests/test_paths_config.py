@@ -26,11 +26,14 @@ def test_data_root_documented_default(monkeypatch):
     assert paths.data_root() == Path(default)
 
 
-@pytest.mark.parametrize("bad", ["", "a/b", "a\\b", "x:y", "../up"])
+@pytest.mark.parametrize("bad", ["", "a/b", "a\\b", "x:y", "../up", "..", "dot.", "dump.jsonl", "nul", "NUL.txt",
+                                 "con", "aux.log", "COM1", "lpt9", "conin$", "CONOUT$"])
 def test_run_dir_rejects_paths(monkeypatch, tmp_path, bad):
+    """The same rule as TraceWriter: loopkit.traces.check_run_id."""
     monkeypatch.setenv("LOOPKIT_DATA", str(tmp_path))
     with pytest.raises(ValueError):
         paths.run_dir(bad)
+    assert not (tmp_path / "runs").exists()  # rejected before anything is created
 
 
 def test_disk_floor(tmp_path):

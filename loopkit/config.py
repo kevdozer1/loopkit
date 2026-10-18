@@ -9,6 +9,7 @@ and never printed, logged or put in an exception message: a missing key raises
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any, Literal
@@ -123,12 +124,14 @@ class ModelEntry(BaseModel):
     # optional, adapter-specific
     cached_in: float | None = None
     direct: DirectRoute | None = None
+    alt_route: DirectRoute | None = None
     fallback_id: str | None = None
     base_url: str | None = None
     endpoint: str | None = None
     env_key: str | None = None
     json_mode: str | None = None
     reasoning: dict[str, Any] | None = None
+    image_tokens: int | None = None
     notes: str | None = None
 
     @field_validator("adapter")
@@ -141,9 +144,18 @@ class ModelEntry(BaseModel):
     @field_validator("price_in", "price_out", "cached_in")
     @classmethod
     def _non_negative(cls, value: float | None) -> float | None:
-        if value is not None and value < 0:
-            raise ValueError("prices are non-negative USD per million tokens")
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise ValueError("prices are finite non-negative USD per million tokens (no NaN or infinity)")
         return value
+
+    @model_validator(mode="after")
+    def _zero_prices_marked_free(self) -> "ModelEntry":
+        # a paid adapter at 0 / 0 is usually a typo or a promotion; the router still treats it as paid
+        if self.adapter != "fake" and self.price_in == 0 and self.price_out == 0 \
+                and "free" not in (self.notes or "").lower():
+            raise ValueError("price_in and price_out are both 0 for a non-fake adapter. If the model really is "
+                             "free, say so with notes: free (and why); otherwise set its prices")
+        return self
 
     @field_validator("accessed", mode="before")
     @classmethod

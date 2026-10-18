@@ -1,0 +1,44 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "failure_summary": {
+      "title": "Failure Summary",
+      "type": "string"
+    },
+    "graph_after_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Graph After Hash"
+    },
+    "graph_before_hash": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Graph Before Hash"
+    },
+    "round": {
+      "minimum": 0,
+      "title": "Round",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "round",
+    "graph_before_hash",
+    "graph_after_hash",
+    "failure_summary"
+  ],
+  "title": "PatchPayload",
+  "type": "object"
+}

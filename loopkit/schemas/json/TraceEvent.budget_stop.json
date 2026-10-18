@@ -1,0 +1,29 @@
+{
+  "additionalProperties": true,
+  "properties": {
+    "cap_usd": {
+      "title": "Cap Usd",
+      "type": "number"
+    },
+    "reason": {
+      "title": "Reason",
+      "type": "string"
+    },
+    "scope": {
+      "title": "Scope",
+      "type": "string"
+    },
+    "spent_usd": {
+      "title": "Spent Usd",
+      "type": "number"
+    }
+  },
+  "required": [
+    "scope",
+    "cap_usd",
+    "spent_usd",
+    "reason"
+  ],
+  "title": "BudgetStopPayload",
+  "type": "object"
+}

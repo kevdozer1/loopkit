@@ -1,0 +1,84 @@
+{
+  "additionalProperties": false,
+  "description": "A skill's name, docstring and JSON Schemas. ``params`` is closed: a param it does not declare is an\nerror unless it sets additionalProperties to true or a schema. A ``returns`` object with\nadditionalProperties is a map output: any field name can be read.",
+  "properties": {
+    "big_model": {
+      "default": false,
+      "description": "Calls a model through the router when it runs",
+      "title": "Big Model",
+      "type": "boolean"
+    },
+    "category": {
+      "default": "other",
+      "enum": [
+        "perception",
+        "motion",
+        "manipulation",
+        "calibration",
+        "terminal",
+        "other"
+      ],
+      "title": "Category",
+      "type": "string"
+    },
+    "docstring": {
+      "title": "Docstring",
+      "type": "string"
+    },
+    "name": {
+      "pattern": "^[a-z_][a-z0-9_]*$",
+      "title": "Name",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "description": "JSON Schema (type object) for the skill's params",
+      "title": "Params",
+      "type": "object"
+    },
+    "postconditions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Postconditions",
+      "type": "array"
+    },
+    "preconditions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Preconditions",
+      "type": "array"
+    },
+    "returns": {
+      "additionalProperties": true,
+      "description": "JSON Schema (type object) for the skill's outputs",
+      "title": "Returns",
+      "type": "object"
+    },
+    "terminal": {
+      "anyOf": [
+        {
+          "enum": [
+            "done",
+            "abort"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Terminal"
+    }
+  },
+  "required": [
+    "name",
+    "docstring",
+    "params",
+    "returns"
+  ],
+  "title": "SkillSpec",
+  "type": "object"
+}

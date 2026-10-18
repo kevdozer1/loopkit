@@ -1,0 +1,208 @@
+{
+  "$defs": {
+    "AABB": {
+      "additionalProperties": false,
+      "description": "Axis-aligned box in the robot base frame, metres. ``min`` is below ``max`` on every axis.",
+      "properties": {
+        "max": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Max",
+          "type": "array"
+        },
+        "min": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Min",
+          "type": "array"
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "title": "AABB",
+      "type": "object"
+    },
+    "Budgets": {
+      "additionalProperties": false,
+      "properties": {
+        "max_big_model_calls": {
+          "description": "Model calls allowed while the program runs (runtime, not setup)",
+          "minimum": 0,
+          "title": "Max Big Model Calls",
+          "type": "integer"
+        },
+        "max_seconds": {
+          "description": "Sim seconds allowed for one program run",
+          "exclusiveMinimum": 0,
+          "title": "Max Seconds",
+          "type": "number"
+        },
+        "max_usd": {
+          "description": "USD allowed for runtime model calls in one program run",
+          "minimum": 0,
+          "title": "Max Usd",
+          "type": "number"
+        }
+      },
+      "required": [
+        "max_big_model_calls",
+        "max_usd",
+        "max_seconds"
+      ],
+      "title": "Budgets",
+      "type": "object"
+    },
+    "Safety": {
+      "additionalProperties": false,
+      "properties": {
+        "max_force": {
+          "description": "Maximum estimated contact force at the hand, N",
+          "exclusiveMinimum": 0,
+          "title": "Max Force",
+          "type": "number"
+        },
+        "max_speed": {
+          "description": "Maximum commanded tool speed, m/s",
+          "exclusiveMinimum": 0,
+          "title": "Max Speed",
+          "type": "number"
+        },
+        "workspace_bounds": {
+          "$ref": "#/$defs/AABB",
+          "description": "The tool centre point must stay inside this box (base frame)"
+        }
+      },
+      "required": [
+        "workspace_bounds",
+        "max_speed",
+        "max_force"
+      ],
+      "title": "Safety",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One task. ``params`` holds this instance's values (they vary per seed);\n``params_schema`` declares them. Every key of ``params`` is declared in\n``params_schema`` and every value satisfies its schema. A graph reads them as\n``{\"ref\": \"task.<name>\"}``. Budget and safety numbers are finite (no inf or NaN),\nand the workspace box's min is below its max on every axis.\n\n``nominal_geometry`` is the fixture geometry the robot may know (the \"BIM\"):\nnominal poses and dimensions. The real poses differ by the per-seed\nrandomization, so skills still have to localize.",
+  "properties": {
+    "allowed_skills": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Allowed Skills",
+      "type": "array"
+    },
+    "budgets": {
+      "$ref": "#/$defs/Budgets"
+    },
+    "checker_id": {
+      "title": "Checker Id",
+      "type": "string"
+    },
+    "end_condition": {
+      "title": "End Condition",
+      "type": "string"
+    },
+    "goal_text": {
+      "title": "Goal Text",
+      "type": "string"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "nominal_geometry": {
+      "additionalProperties": true,
+      "title": "Nominal Geometry",
+      "type": "object"
+    },
+    "output_schema": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Output Schema"
+    },
+    "params": {
+      "additionalProperties": true,
+      "description": "This instance's param values: declared in params_schema and valid against it",
+      "title": "Params",
+      "type": "object"
+    },
+    "params_schema": {
+      "additionalProperties": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "description": "JSON Schema for each task param, by name",
+      "title": "Params Schema",
+      "type": "object"
+    },
+    "safety": {
+      "$ref": "#/$defs/Safety"
+    },
+    "scene_id": {
+      "title": "Scene Id",
+      "type": "string"
+    },
+    "seed": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Seed"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "goal_text",
+    "end_condition",
+    "checker_id",
+    "scene_id",
+    "allowed_skills",
+    "nominal_geometry",
+    "budgets",
+    "safety"
+  ],
+  "title": "TaskSpec",
+  "type": "object"
+}

@@ -1,0 +1,67 @@
+{
+  "additionalProperties": true,
+  "description": "A Verdict, flattened: evidence.metrics and evidence.image_paths sit at the top level (a\nVerdict-shaped payload is flattened on the way in; top-level keys win). The Verdict rules hold:\na passed verdict has score 1, no failure_class and no failing_node; a failed one has a\nfailure_class and a score below 1.",
+  "properties": {
+    "failing_node": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Failing Node"
+    },
+    "failure_class": {
+      "anyOf": [
+        {
+          "enum": [
+            "perception",
+            "grasp",
+            "alignment",
+            "stopping",
+            "timeout",
+            "safety",
+            "other"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Failure Class"
+    },
+    "image_paths": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Image Paths",
+      "type": "array"
+    },
+    "metrics": {
+      "additionalProperties": true,
+      "title": "Metrics",
+      "type": "object"
+    },
+    "passed": {
+      "title": "Passed",
+      "type": "boolean"
+    },
+    "score": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Score",
+      "type": "number"
+    }
+  },
+  "required": [
+    "passed",
+    "score"
+  ],
+  "title": "VerdictPayload",
+  "type": "object"
+}

@@ -1,0 +1,123 @@
+{
+  "$defs": {
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "image_paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Image Paths",
+          "type": "array"
+        },
+        "metrics": {
+          "additionalProperties": true,
+          "title": "Metrics",
+          "type": "object"
+        }
+      },
+      "title": "Evidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A checker's score for one run. A passed verdict has score 1, no failure_class and no\nfailing_node. A failed verdict names its failure_class and has a partial score below 1.",
+  "properties": {
+    "checker_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Checker Id"
+    },
+    "evidence": {
+      "$ref": "#/$defs/Evidence"
+    },
+    "failing_node": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The node that failed; absent when passed",
+      "title": "Failing Node"
+    },
+    "failure_class": {
+      "anyOf": [
+        {
+          "enum": [
+            "perception",
+            "grasp",
+            "alignment",
+            "stopping",
+            "timeout",
+            "safety",
+            "other"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Required when failed, absent when passed",
+      "title": "Failure Class"
+    },
+    "passed": {
+      "title": "Passed",
+      "type": "boolean"
+    },
+    "score": {
+      "description": "1 when passed, else a partial score below 1",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Score",
+      "type": "number"
+    },
+    "seed": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Seed"
+    },
+    "summary": {
+      "default": "",
+      "title": "Summary",
+      "type": "string"
+    },
+    "task_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Task Id"
+    }
+  },
+  "required": [
+    "passed",
+    "score"
+  ],
+  "title": "Verdict",
+  "type": "object"
+}
