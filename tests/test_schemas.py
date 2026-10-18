@@ -18,7 +18,11 @@ closed params, error text, strict graph numbers and the JSON Schema export.
 "verifier fixes, round 2" has one block per finding of the independent schema
 verification: linear fence scanning, refs in unions, groups of loops, terminal
 edges, params under an alias key, long ref indexes, bounded suggestion work and
-repair text, and prose braces before the graph.
+repair text, and prose braces before the graph. "verifier fixes, round 3" has one
+block per finding of the second verification: polynomial union typing with the
+fewest mismatches, zero-padded ref indexes, capped fixes for unknown edge ends and
+entries, JSON examples in prose, terminal edges in reachability and the ref rule,
+and short messages for large groups of loops.
 """
 
 from __future__ import annotations
@@ -1334,13 +1338,17 @@ def test_cycles_and_reachability_match_brute_force():
         assert any(e.code == "no_done" for e in errs) == ("done" not in live)
 
 
-def _can_run_before_success(g: dict[str, Any], reader: str, src: str) -> bool:
-    """Brute force over (node, src-has-succeeded) states: can ``reader`` run while ``src`` has not succeeded yet?"""
+def _can_run_before_success(g: dict[str, Any], reader: str, src: str, stop: Iterable[str] = ()) -> bool:
+    """Brute force over (node, src-has-succeeded) states: can ``reader`` run while ``src`` has not succeeded yet?
+    A run ends at a node in ``stop``."""
     nxt = {(e["src"], e["on"]): e["dst"] for e in g["edges"]}
+    stop = set(stop)
     start = (g["entry"], False)
     seen, todo = {start}, [start]
     while todo:
         v, ok = todo.pop()
+        if v in stop:
+            continue
         for on in ("success", "failure"):
             w = nxt.get((v, on))
             state = (w, ok or (v == src and on == "success"))
@@ -2417,13 +2425,12 @@ _UNION_SKILL = SkillSpec(name="shapes", docstring="Takes unions of containers.",
 }))
 
 
-def _union_errors(params: dict[str, Any]) -> list[GraphError]:
+def _union_errors(params: dict[str, Any], skill: SkillSpec = _UNION_SKILL) -> list[GraphError]:
     g = good_graph()
-    g["nodes"].insert(1, {"id": "use", "skill": "shapes", "params": params})
+    g["nodes"].insert(1, {"id": "use", "skill": skill.name, "params": params})
     set_edge(g, "locate_box", "success", "use")
     g["edges"] += [edge("use", "approach_box", "success"), edge("use", "abort", "failure")]
-    return errors_for(g, task=make_task(allowed_skills=TASK.allowed_skills + ["shapes"]),
-                      catalog=CATALOG + [_UNION_SKILL])
+    return errors_for(g, task=make_task(allowed_skills=TASK.allowed_skills + [skill.name]), catalog=CATALOG + [skill])
 
 
 @pytest.mark.parametrize("params", [
@@ -2765,3 +2772,246 @@ def test_broken_json_after_prose_braces_is_still_bad_json():
     assert [e.code for e in validate_graph(str(good_graph()), CATALOG, TASK)] == ["bad_json"]  # holds "params": {}
     assert validate_graph("{x} " * 49 + t, CATALOG, TASK) == []  # the 50th "{" is still tried
     assert [e.code for e in validate_graph("{x} " * 50 + t, CATALOG, TASK)] == ["bad_json"]  # the 51st is not
+
+
+# ====================================================== verifier fixes, round 3
+# One block per finding of the second schema verification. Each docstring names the defect.
+
+# ---- R3.1 refs in nested unions: polynomial time, typed against the branch with the fewest mismatches
+_TREE = {"anyOf": [{"type": "array", "items": {"anyOf": [{"$ref": "#/$defs/T"}, {"type": "string"}]}},
+                   {"type": "array", "items": {"anyOf": [{"$ref": "#/$defs/T"}, {"type": "number"}]}}]}
+_TREE_SKILL = SkillSpec(name="tree", docstring="Takes a nested tree.", returns=obj({}),
+                        params={"type": "object", "properties": {"t": {"$ref": "#/$defs/T"}}, "$defs": {"T": _TREE},
+                                "additionalProperties": False})
+
+
+def _tree_errors(levels: int, leaf: Any) -> list[GraphError]:
+    """``leaf`` inside ``levels - 1`` nested arrays, so the param value nests ``levels`` levels, the ref's own
+    included."""
+    value = leaf
+    for _ in range(levels - 1):
+        value = [value]
+    g = good_graph()
+    g["nodes"].insert(1, {"id": "use", "skill": "tree", "params": {"t": value}})
+    set_edge(g, "locate_box", "success", "use")
+    g["edges"] += [edge("use", "approach_box", "success"), edge("use", "abort", "failure")]
+    return validate_graph(g, CATALOG + [_TREE_SKILL], make_task(allowed_skills=TASK.allowed_skills + ["tree"]))
+
+
+@pytest.mark.parametrize("levels", [14, 32])
+def test_refs_deep_in_a_recursive_union_are_typed_in_polynomial_time(levels):
+    """Was: choosing a union branch walked the whole subtree once per passing branch at every nested union, so
+    a boolean ref inside 12 nested arrays of T = anyOf[array of (T or string), array of (T or number)] took
+    14 s and inside 14 arrays 2 minutes. 32 levels is the deepest a param may nest."""
+    from loopkit.schemas.graph import MAX_PARAM_DEPTH
+
+    for leaf, codes in (({"ref": "locate_box.yaw"}, []), ({"ref": "locate_box.found"}, ["ref_type_mismatch"])):
+        start = time.perf_counter()
+        errs = _tree_errors(levels, leaf)
+        elapsed = time.perf_counter() - start
+        assert [e.code for e in errs] == codes, format_errors(errs)
+        assert elapsed < 1.0, f"{levels} levels: {elapsed:.2f} s"
+    expect_error(errs, "ref_type_mismatch", "use", "param 't" + "[0]" * (levels - 1) + "'",
+                 "locate_box.found is boolean", "needs array or string")
+    assert [e.code for e in _tree_errors(MAX_PARAM_DEPTH + 1, {"ref": "locate_box.yaw"})] == ["bad_param"]
+
+
+_GRID_SKILL = SkillSpec(name="grids", docstring="Takes unions of containers.", returns=obj({}), params=obj({
+    "grid": {"anyOf": [{"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+                       {"type": "array", "items": {"type": "array", "items": {"type": "number"}}}]},
+    "table": {"anyOf": [{"type": "object", "additionalProperties": {"type": "string"}},
+                        {"type": "object", "additionalProperties": {"type": "number"}}]},
+}))
+
+
+@pytest.mark.parametrize("params,path", [
+    pytest.param({"grid": [[{"ref": "locate_box.found"}, {"ref": "locate_box.yaw"}, {"ref": "locate_box.width_mm"}]]},
+                 "grid[0][0]", id="nested_arrays"),
+    pytest.param({"table": {"a": {"ref": "locate_box.found"}, "b": {"ref": "locate_box.yaw"},
+                            "c": {"ref": "locate_box.width_mm"}}}, "table.a", id="map_values"),
+])
+def test_a_ref_no_union_branch_takes_is_reported_against_the_branch_with_the_fewest_mismatches(params, path):
+    """Was: when no branch took every ref, the refs were typed against the first passing branch, so a value one
+    fix away from the second branch got a mismatch for each of its other refs (three here, not one)."""
+    errs = _union_errors(params, _GRID_SKILL)
+    assert [e.code for e in errs] == ["ref_type_mismatch"], format_errors(errs)
+    expect_error(errs, "ref_type_mismatch", "use", f"param '{path}'", "locate_box.found is boolean", "needs number")
+
+
+# ---- R3.2 a zero-padded item number in a ref path is read the way the interpreter reads it
+@pytest.mark.parametrize("index", [
+    "01", "000000001", "0000000001", "0000000000", "0" * 30 + "2",  # int() reads these as items 1, 1, 1, 0 and 2
+    "3", "1" + "0" * 9, "0" * 5000 + "1",  # past a 3-vector; int() refuses more than 4300 digits, zeros included
+])
+def test_a_ref_item_number_is_valid_exactly_when_the_interpreter_can_read_it(index):
+    """Was: the 9-digit limit counted leading zeros, so locate_box.position.0000000001 was out of range although
+    the interpreter reads it with int() as item 1."""
+    from loopkit.runtime.interpreter import _lookup
+
+    try:
+        _lookup({"position": [0.1, 0.2, 0.3]}, ["position", index], "r")
+        readable = True
+    except Exception:  # noqa: BLE001  (an unresolved ref, or the ValueError of int() past 4300 digits)
+        readable = False
+    g = good_graph()
+    node(g, "approach_box")["params"]["yaw"] = {"ref": "locate_box.position." + index}
+    errs = errors_for(g)
+    assert (errs == []) == readable, (index[:40], format_errors(errs))
+    if not readable:
+        err = expect_error(errs, "ref_unknown_field", "approach_box", "locate_box.position has at most 3 items")
+        assert err.fix == "Use an item number from 0 to 2" and len(err.message) < 300
+
+
+# ---- R3.3 unknown edge ends and an unknown entry get the closest ids, not every id
+def test_unknown_edge_ends_and_entry_suggest_the_closest_ids_not_every_id():
+    """Was: unknown_edge_node and unknown_entry fixes listed every node id, so 2,000 nodes whose success edges
+    named misspelled ids made 215 MB of fix text."""
+    g = _chain(2000)
+    for e in g["edges"]:
+        if e["on"] == "success" and e["dst"] != "done":
+            e["dst"] += "q"
+    start = time.perf_counter()
+    errs = validate_graph(json.dumps(g), CATALOG, TASK)
+    assert time.perf_counter() - start < 3
+    unknown = [e for e in errs if e.code == "unknown_edge_node"]
+    assert len(unknown) == 1999 and max(len(e.fix) for e in errs) < 300
+    # 2,002 ids are past the comparison budget, so these get the cheap guess: the longest id the name starts with
+    assert unknown[0].fix == "Edges connect existing node ids. Node ids that start most like it: n1, n1998, n1999, n2, n20"
+    g["entry"] = "n0q"
+    err = expect_error(validate_graph(g, CATALOG, TASK), "unknown_entry", None, "'n0q'")
+    assert err.fix.startswith("Set entry to the first node to run. Node ids that start most like it: n0, ")
+    assert len(err.fix) < 300
+
+    g = good_graph()
+    set_edge(g, "approach_slot", "success", "relase_box")
+    g["entry"] = "locate_bx"
+    errs = errors_for(g)
+    assert [e.code for e in errs] == ["unknown_entry", "unknown_edge_node"]
+    entry, dst = errs
+    assert entry.fix.startswith("Set entry to the first node to run. Did you mean 'locate_box'? The node ids closest "
+                                "to it: locate_box, ")
+    assert dst.node == "approach_slot" and dst.fix.startswith(
+        "Edges connect existing node ids. Did you mean 'release_box'? The node ids closest to it: release_box, ")
+    assert len(dst.fix.split(": ", 1)[1].split(", ")) == 5
+
+
+# ---- R3.4 a JSON example or an empty object in prose before the graph is not the graph
+@pytest.mark.parametrize("prose", [
+    "Use {} for a skill with no params.\n",
+    "Use { } for a skill with no params.\n",
+    'I used {"ref": "locate_box.position"} for the approach.\n',
+    'A node looks like {"id": "x", "skill": "locate"}. The graph:\n',
+    "Set {a {b}} here: ",
+    'He said {"hi"} then ',
+])
+def test_json_in_prose_before_the_graph_is_not_the_graph(prose):
+    """Was: the first object in the reply was the graph, so an empty object or a JSON example in the prose
+    gave bad_shape, and prose braces that look like broken JSON ended the search with bad_json."""
+    text = prose + json.dumps(good_graph(), indent=1)
+    assert validate_graph(text, CATALOG, TASK) == []
+    graph, errs = parse_graph(text)
+    assert errs == [] and graph == ProgramGraph.model_validate(good_graph())
+
+
+def test_a_reply_without_a_graph_object_reports_its_first_brace():
+    """With no object that has "nodes", the first "{" is reported as before: a comment right after the graph's
+    own opening brace is bad_json at the comment (it had made a node object be taken as the graph), and a lone
+    object reports its missing fields. Broken JSON after the prose is still the error reported."""
+    t = json.dumps(good_graph())
+    errs = validate_graph('{ // the graph\n "note": "}", ' + t[1:], CATALOG, TASK)
+    assert [e.code for e in errs] == ["bad_json"]
+    expect_error(errs, "bad_json", None, "Expecting property name enclosed in double quotes at line 1, column 3")
+    errs = validate_graph("Use {} for a skill with no params.", CATALOG, TASK)
+    assert {e.code for e in errs} == {"bad_shape"} and "nodes: Field required" in errs[0].message
+    err = validate_graph('Use {"ref": "a.b"} like this: ' + t[:-12], CATALOG, TASK)[0]  # the graph is cut off
+    assert err.code == "bad_json" and err.fix.endswith("If your reply was cut off, return a shorter graph")
+
+
+def test_nested_broken_objects_are_not_decoded_fifty_times():
+    """Trying every "{" decoded 50 nested objects around a cut-off 1 MB array 50 times over (0.9 s); the tries
+    stop once they have decoded four times the reply."""
+    text = '{"a": ' * 50 + "[" + "1, " * 333_000
+    start = time.perf_counter()
+    errs = validate_graph(text, CATALOG, TASK)
+    elapsed = time.perf_counter() - start
+    assert [e.code for e in errs] == ["bad_json"] and elapsed < 0.5, f"{elapsed:.2f} s"
+    assert errs[0].fix.endswith("If your reply was cut off, return a shorter graph")
+
+
+# ---- R3.5 edges out of terminal nodes do not feed reachability or the ref rule
+def test_edges_out_of_terminal_nodes_are_not_followed():
+    """Was: an edge out of abort or done was followed when checking reachability and refs, so abort ->
+    approach_slot gave two ref_not_upstream errors, and a node reached only through an edge out of done was not
+    reported unreachable."""
+    g = good_graph()
+    g["edges"].append(edge("abort", "approach_slot", "success"))
+    errs = errors_for(g)
+    assert [e.code for e in errs] == ["terminal_has_edges"]
+    g = good_graph()
+    g["nodes"].insert(6, {"id": "wave", "skill": "release", "params": {"open_mm": 10}})
+    g["edges"] += [edge("done", "wave", "success"), edge("wave", "done", "success"), edge("wave", "abort", "failure")]
+    errs = errors_for(g)
+    assert [e.code for e in errs] == ["terminal_has_edges", "unreachable"]
+    expect_error(errs, "unreachable", "wave")
+
+
+def test_reachability_and_the_ref_rule_stop_at_terminal_nodes_as_brute_force_finds():
+    rng = random.Random(1019)
+    checked = 0
+    for _ in range(300):
+        g = _random_graph(rng, rng.randint(2, 8), refs=True)
+        ids = [n["id"] for n in g["nodes"]]
+        for t in ("done", "abort"):
+            for on in ("success", "failure"):
+                if rng.random() < 0.5:
+                    g["edges"].append(edge(t, rng.choice(ids), on))
+        errs = validate_graph(g, CATALOG, TASK)
+        stop = set(g["terminal_nodes"])
+        adj = {v: set() if v in stop else ws for v, ws in _adjacency(g).items()}
+        live = {g["entry"]} | _reach(adj, g["entry"])
+        assert {e.node for e in errs if e.code == "unreachable"} == set(adj) - live, (g, format_errors(errs))
+        assert any(e.code == "no_done" for e in errs) == ("done" not in live)
+        flagged = {e.node for e in errs if e.code == "ref_not_upstream"}
+        for n in g["nodes"]:
+            if n["skill"] != "grasp":
+                continue
+            me, src = n["id"], n["params"]["width_mm"]["ref"].split(".")[0]
+            if me in live:
+                assert (me in flagged) == _can_run_before_success(g, me, src, stop), (me, src, g)
+                checked += 1
+            elif me not in _reach(adj, src):
+                assert me in flagged, (me, src, g)
+    assert checked > 500
+
+
+# ---- R3.6 a large group of loops: a shortest example loop and at most 20 node ids
+def test_a_large_group_of_loops_names_a_shortest_loop_and_twenty_ids():
+    """Was: the example loop came from a depth-first search, so a 3,000-node group showed a 3,000-node example
+    loop and listed all 3,000 ids; format_errors clipped the line before 'one of several loops'."""
+    g = _chain(3000)
+    for e in g["edges"]:
+        if e["on"] == "failure" and e["src"] != "n0":
+            e["dst"] = "n0"
+    start = time.perf_counter()
+    errs = validate_graph(g, CATALOG, TASK)
+    assert time.perf_counter() - start < 5
+    assert [e.code for e in errs] == ["unbounded_cycle"]
+    err = expect_error(errs, "unbounded_cycle", "n0")
+    first = ", ".join(f"n{i}" for i in range(20))
+    assert err.message == (f"nodes n0 -> n1 -> n0 form a loop with no visit bound, one of several loops among the nodes "
+                           f"{first} and 2980 more. One max_visits ends them all only on a node that every loop runs "
+                           f"through and whose failure edge leaves all of the loops")
+    line = format_errors(errs).splitlines()[0]
+    assert "[...]" not in line and line.endswith(err.fix)
+
+    g = _chain(3000)
+    set_edge(g, "n2999", "failure", "n0")  # one loop through all 3,000 nodes
+    err = expect_error(validate_graph(g, CATALOG, TASK), "unbounded_cycle", "n0")
+    assert err.message == ("nodes " + " -> ".join(f"n{i}" for i in range(19)) + " -> (2980 more) -> n2999 -> n0 form a "
+                           "loop with no visit bound")
+
+    g = good_graph()  # two loops through locate_box; the shorter one is the example
+    set_edge(g, "approach_box", "failure", "locate_box")
+    set_edge(g, "grasp_box", "failure", "locate_box")
+    expect_error(errors_for(g), "unbounded_cycle", "locate_box", "nodes locate_box -> approach_box -> locate_box form a "
+                 "loop with no visit bound, one of several loops among the nodes locate_box, approach_box, grasp_box")

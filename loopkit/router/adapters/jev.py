@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..errors import ModelCallError, RouterError
 from ..redact import redact, scrub
-from .base import Adapter, AdapterRequest, AdapterResult, as_cost, as_int, check_url
+from .base import Adapter, AdapterRequest, AdapterResult, as_cost, check_url
 
 if TYPE_CHECKING:  # pragma: no cover
     from ...config import ModelEntry
@@ -93,8 +93,8 @@ class JevAdapter(Adapter):
         return AdapterResult(
             text=json.dumps(answers),
             json_value=answers,
-            input_tokens=as_int(usage.get("input_tokens")),
-            output_tokens=as_int(usage.get("output_tokens")),
+            input_tokens=usage.get("input_tokens"),  # as reported: chat() drops a value that is not a count
+            output_tokens=usage.get("output_tokens"),
             usd=as_cost(usage.get("cost")),  # not in the API today; used if it ever appears
             model_returned=data.get("model") if isinstance(data.get("model"), str) else None,
             raw=raw,

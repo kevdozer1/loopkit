@@ -8,6 +8,8 @@ import io
 import json
 import math
 import os
+import random
+import re
 import subprocess
 import sys
 import threading
@@ -1671,14 +1673,17 @@ def test_g6_a_token_count_that_is_not_a_count_is_treated_as_missing(ask, ledger,
     assert "input_tokens" in r.raw["usd_note"] and "not a token count" in r.raw["usd_note"]
     assert rec.events[0][1]["ok"] is True and rec.events[0][1]["input_tokens"] is None
     ModelCallPayload.model_validate(rec.events[0][1])
-    # every count field; with no cost and nothing left to price, the call stays counted at its projection
+    # every count field; with no cost and nothing left to price, the call is counted at its projection. H6: a dropped
+    # count and no usable cost now settle it there (the cautious choice), with the note; before, it stayed reserved
     usage = {"prompt_tokens": 1e13, "completion_tokens": 10 ** 12,
              "completion_tokens_details": {"reasoning_tokens": 10 ** 30},
              "prompt_tokens_details": {"cached_tokens": 10 ** 400}}
     r2 = ask("orm", "every count huge", http=Server(body_with(usage)).client())
     assert (r2.input_tokens, r2.output_tokens, r2.reasoning_tokens, r2.cached_tokens) == (None, None, None, None)
     assert r2.usd == pytest.approx(r2.projected_usd) and r2.usd_source == "computed"
-    assert _reserves(ledger)[-1]["id"] not in {s["id"] for s in _settles(ledger)}
+    settle = _settles(ledger)[-1]
+    assert settle["id"] == _reserves(ledger)[-1]["id"] and settle["usd"] == pytest.approx(r2.projected_usd)
+    assert "settled at its projection" in settle["note"] and "unreconciled_attempts" not in r2.raw
     # a cost too large for a float is no cost: the token counts price the call
     r3 = ask("orm", "a huge cost", http=Server(body_with({"prompt_tokens": 600, "completion_tokens": 3,
                                                           "cost": 10 ** 400})).client())
@@ -1748,3 +1753,222 @@ def test_o1_an_attempt_that_cannot_connect_settles_at_zero(ask, ledger, monkeypa
             ask("orm", f"lost {lost}", http=Server(lost).client())
         assert not err.value.rejected_before_generation
         assert ledger.spent() - before == pytest.approx(3 * _reserves(ledger)[-1]["usd"])
+
+
+# =========================================================================== round 3: one regression test per finding
+# the fence pattern parse_json_text used before H1 (it backtracks cubically), kept to check the scan that replaced it
+OLD_FENCE_RE = re.compile(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n?(.*?)```", re.DOTALL)
+BACKSLASH = chr(92)
+
+
+def _u_escaped(text: str, at: int = 0) -> str:
+    """``text`` as JSON string content with the character at ``at`` written as a backslash-u escape."""
+    return json.dumps(text[:at])[1:-1] + BACKSLASH + "u%04x" % ord(text[at]) + json.dumps(text[at + 1:])[1:-1]
+
+
+def _with_key(key: str, *texts: str) -> list[str]:
+    """The texts that hold ``key`` in any of the forms the router cuts from text (as written, JSON-escaped)."""
+    from loopkit.router.redact import secret_forms
+
+    return [t[:80] for t in texts if any(form in t for form in secret_forms(key))]
+
+
+def _usage_body(usage: dict, **kw):
+    """A handler whose answer reports ``usage`` byte for byte (so NaN and Infinity arrive as JSON tokens)."""
+    body = or_response(**kw)
+    body["usage"] = usage
+    text = json.dumps(body)
+    return lambda request: httpx.Response(200, content=text.encode())
+
+
+# --------------------------------------------------------------------------- H1: the fence scan is linear
+def test_h1_fenced_blocks_match_the_old_pattern_on_random_text():
+    tick, cr, lf, tab = "`", "\r", "\n", "\t"
+    alphabet = tick * 14 + (" " + tab) * 2 + "ajZ09" + (cr + lf) * 2 + "{}" + "\"'" + "_+-"
+    pieces = [tick * 3, tick * 3, tick * 3 + "json", tick * 3 + "py ", tick * 3 + lf, tick * 2, tick, " ", tab,
+              cr + lf, lf, cr, "{", "}", '"', "x", "1", "+", "json", " " + tab + " "]
+    fixed = ["", tick * 3, tick * 4, tick * 5, tick * 6, tick * 7, tick * 3 + lf + tick * 3, "```json\r\n{}```",
+             "```a b\n{}```", "``` \t py \t\r\n[1]```x```", "```\r```", "```\n```\n```", 'x```{"a": 1}```y```']
+    rng = random.Random(20261017)
+    texts = fixed + ["".join(rng.choice(alphabet) for _ in range(rng.randrange(40))) if i % 2 else
+                     "".join(rng.choice(pieces) for _ in range(rng.randrange(20))) for i in range(5000)]
+    counts = {"no block": 0, "one block": 0, "several blocks": 0}
+    for text in texts:
+        expected = [m.group(1) for m in OLD_FENCE_RE.finditer(text)]
+        assert router_core._fenced_blocks(text) == expected, repr(text)
+        counts["no block" if not expected else "one block" if len(expected) == 1 else "several blocks"] += 1
+    assert min(counts.values()) > 500, counts  # every case was exercised, not only text without a block
+
+
+def test_h1_a_fence_and_100000_spaces_or_tabs_parse_in_linear_time():
+    # the old pattern took about 1.4 s for 1,000 spaces and 11.6 s for 2,000 (8 times longer per doubling); the
+    # small size runs first, so a scan that is cubic again fails here in seconds instead of running for days
+    for n, limit in ((1_000, 0.1), (100_000, 0.5)):
+        for text in ("```" + " " * n + "x", "```" + "\t" * n + "x", "```" + " \t" * (n // 2) + "{",
+                     "```json" + " " * n + "x", "```" + " " * (n // 2) + "json" + "\t" * (n // 2) + "[",
+                     "``` " * (n // 4) + "x"):
+            t0 = time.perf_counter()
+            value, err = parse_json_text(text)
+            elapsed = time.perf_counter() - t0
+            assert value is None and err.startswith("not JSON") and elapsed < limit, (n, text[:10], elapsed)
+    t0 = time.perf_counter()
+    assert parse_json_text("```" + " " * n + "\n" + '{"a": 1}' + "\n```") == ({"a": 1}, None)
+    assert time.perf_counter() - t0 < 0.5
+
+
+# --------------------------------------------------------------------------- H2: a key in another JSON escape
+def test_h2_a_key_in_another_json_escape_is_cut_from_the_parsed_answer(ask, cache, monkeypatch):
+    long_key = "lk-test-" + "Q7" * 36  # longer than the 60 characters a validation message quotes of a value
+    quote_key = 'lk-test-"quote"-' + "Q7" * 12
+    cases = ((PLAIN_KEY, '{"green": 5, "' + _u_escaped(PLAIN_KEY) + '": "x"}'),  # as a field name
+             (PLAIN_KEY, '{"green": "' + _u_escaped(PLAIN_KEY, 9) + '"}'),  # as a value of the wrong type
+             (long_key, '{"green": "' + _u_escaped(long_key, 3) + '"}'),
+             (quote_key, '{"green": 5, "echo": ["' + _u_escaped(quote_key, 8) + '"]}'))  # one quote escaped, one not
+    for n, (key, content) in enumerate(cases):
+        monkeypatch.setenv("OPENROUTER_API_KEY", key)
+        assert not _with_key(key, content)  # no form the text scrub knows: only parsing turns it back into the key
+        rec = Recorder()
+        r = ask("orm", f"escaped {n}", json_schema=GREEN_SCHEMA, trace=rec,
+                http=Server((200, or_response(content=content))).client())
+        record = cache.path_for(r.request_hash).read_text(encoding="utf-8")
+        decoded = json.dumps(json.loads(r.text), ensure_ascii=False)
+        assert not _with_key(key, r.text, decoded, json.dumps(r.json), r.json_error or "", json.dumps(rec.events),
+                             record), n
+        assert r.json_error and key[:16] not in r.json_error  # validated after the scrub: no half key either
+        assert r.text == json.dumps(r.json) and "[redacted]" in r.text  # rebuilt from the scrubbed value
+        hit = ask("orm", f"escaped {n}", json_schema=GREEN_SCHEMA)
+        assert hit.cache_hit and (hit.text, hit.json, hit.json_error) == (r.text, r.json, r.json_error)
+    assert r.json == {"green": 5, "echo": ["[redacted]"]}
+    # an answer without the key is kept exactly as written
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+    fenced = 'Sure:\n```json\n{"green": 5}\n```'
+    r = ask("orm", "no key here", json_schema=GREEN_SCHEMA, http=Server((200, or_response(content=fenced))).client())
+    assert r.text == fenced and r.json == {"green": 5} and r.json_error is None
+    # a scrubbed value too deep to write back gives no text, never the original one, and nothing is cached
+    deep: list = []
+    for _ in range(100_000):
+        deep = [deep]
+    assert router_core._rebuilt_text(deep) == ""
+    monkeypatch.setattr(router_core, "_rebuilt_text", lambda value: "")
+    content = '{"green": "' + _u_escaped(PLAIN_KEY) + '"}'
+    r = ask("orm", "cannot rebuild", json_schema=GREEN_SCHEMA,
+            http=Server((200, or_response(content=content))).client())
+    assert r.text == "" and r.json == {"green": "[redacted]"} and not cache.path_for(r.request_hash).exists()
+
+
+# --------------------------------------------------------------------------- H3: redact, then cut to length
+def test_h3_error_text_is_redacted_before_it_is_cut_to_length(ask, ledger, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+    prefix = PLAIN_KEY[:12]  # what a cut through the key would have left
+    words = "word " * 56  # 280 characters; words, so the media scrub sees no base64 run to remove with the key
+
+    def unreadable(self, *a, **k):  # the key straddles the 300-character cut
+        raise RuntimeError(words + PLAIN_KEY + " and more")
+
+    with monkeypatch.context() as m:
+        m.setattr(OpenRouterAdapter, "_success", unreadable)
+        rec = Recorder()
+        with pytest.raises(ModelCallError, match="could not be read") as err:
+            ask("orm", "unreadable", http=Server((200, or_response())).client(), trace=rec)
+    for text in (str(err.value), repr(err.value), json.dumps(rec.events)):
+        assert prefix not in text
+    assert "[redacted]" in str(err.value)
+
+    class BrokenTrace:
+        def emit(self, kind, payload):
+            raise OSError(words + PLAIN_KEY)
+
+    with pytest.raises(RouterError, match="failed after the call") as err:
+        ask("orm", "trace broke", http=Server((200, or_response())).client(), trace=BrokenTrace())
+    assert prefix not in str(err.value) and "[redacted]" in str(err.value)
+
+    def broken_cost(*a, **k):  # the key straddles the 160-character cut of a cost note
+        raise ArithmeticError(words[:130] + PLAIN_KEY)
+
+    monkeypatch.setattr(router_core, "settled_cost", broken_cost)
+    r = ask("orm", "cost broke", http=Server((200, or_response())).client())
+    assert "could not be computed" in r.raw["usd_note"] and prefix not in r.raw["usd_note"]
+
+
+# --------------------------------------------------------------------------- H4: the port is 1 to 65535
+def test_h4_a_port_outside_1_to_65535_is_not_configured_before_any_spend(ask, ledger, monkeypatch):
+    for var in ("ELORIAN_API_KEY", "OPENROUTER_API_KEY", "LK_TEST_SYS1_KEY"):
+        monkeypatch.setenv(var, PLAIN_KEY)
+    jev_kw = {"role": "system1", "extra": {"questions": {"q": {"type": "noul", "instructions": "x"}}}}
+    server = Server((200, or_response()))
+    for key, field, url in (("el", "base_url", "https://elorian.invalid:{}/v1"),
+                            ("orm", "base_url", "https://router.invalid:{}/api/v1"),
+                            ("sys1_vision", "endpoint", "https://decisions.invalid:{}/systemone")):
+        for port in ("0", "65536", "99999", "-1", "1" + "0" * 30):  # httpx parses each; 99999 resolves to 34463
+            models = _models()
+            setattr(models.models[key], field, url.format(port))
+            with pytest.raises(ModelNotConfigured, match="port") as err:
+                ask(key, "hi", models=models, http=server.client(), **(jev_kw if key == "sys1_vision" else {}))
+            assert field in str(err.value) and "from 1 to 65535" in str(err.value)
+    assert not server.requests and ledger.records() == []  # refused before any reservation
+    for port in (1, 65535):  # the ends of the range are ports, and the request goes to the one written
+        models = _models()
+        models.models["el"].base_url = f"https://elorian.invalid:{port}/v1"
+        ask("el", f"port {port}", models=models, http=server.client())
+    assert [r.url.port for r in server.requests] == [1, 65535]
+
+
+# --------------------------------------------------------------------------- H5: every dropped count is noted
+def test_h5_every_token_count_that_is_not_a_count_gets_a_note(ask, ledger, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+    junk = (-5, 2.5, -3.0, "600", True, [600], {"n": 600}, float("nan"), float("inf"), float("-inf"), PLAIN_KEY)
+    for n, value in enumerate(junk):  # not cached: a raw body holding NaN is not plain JSON (the cache skips it)
+        r = ask("orm", f"junk {n}", use_cache=False,
+                http=Server(_usage_body({"prompt_tokens": value, "completion_tokens": 3, "cost": 0.00123})).client())
+        assert r.input_tokens is None and r.output_tokens == 3, value
+        assert r.usd == 0.00123 and r.usd_source == "provider"  # a usable cost is still taken
+        for note in (r.raw["usd_note"], _settles(ledger)[-1]["note"]):
+            assert "the provider's input_tokens (" in note and "not a token count" in note, (value, note)
+            assert PLAIN_KEY not in note and "600" not in note  # a string or a list is described, never quoted
+    for name, usage in (("output_tokens", {"completion_tokens": "3"}),
+                        ("reasoning_tokens", {"completion_tokens": 3,
+                                              "completion_tokens_details": {"reasoning_tokens": -1}}),
+                        ("cached_tokens", {"completion_tokens": 3, "prompt_tokens_details": {"cached_tokens": [9]}})):
+        r = ask("orm", f"field {name}", http=Server(_usage_body({"prompt_tokens": 600, "cost": 0.00123,
+                                                                 **usage})).client())
+        assert getattr(r, name) is None and f"the provider's {name} (" in r.raw["usd_note"]
+        assert f"the provider's {name} (" in _settles(ledger)[-1]["note"]
+    # the Jev adapter passes its counts as reported too
+    monkeypatch.setenv("TYPESAFE_JEV_API_KEY", PLAIN_KEY)
+    jev = Server((200, {"answers": {"q": {"type": "noul", "noul": 0.5}}, "usage": {"input_tokens": "1000"}}))
+    r = ask("jev", "state", role="system1", extra={"questions": {"q": {"type": "noul", "instructions": "x"}}},
+            http=jev.client())
+    assert r.input_tokens is None and "the provider's input_tokens (a value of type str)" in r.raw["usd_note"]
+    # and so does a generation that failed upstream: its settle note names the count it dropped
+    failed = or_response(finish="error", cost=0.0004, prompt=-5, completion=30)
+    with pytest.raises(ModelCallError, match="failed upstream"):
+        ask("orm", "failed with a count that is not one", http=Server((200, failed)).client())
+    settle = _settles(ledger)[-1]
+    assert settle["usd"] == 0.0004 and "the provider's input_tokens (-5) is not a token count" in settle["note"]
+
+
+# --------------------------------------------------------------------------- H6: decision, a dropped count and no cost
+def test_h6_a_dropped_count_without_a_usable_cost_settles_at_the_projection(ask, ledger, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+    for n, usage in enumerate(({"prompt_tokens": -5, "completion_tokens": 3},  # no cost at all
+                               {"prompt_tokens": 600, "completion_tokens": 2.5, "cost": "free"},  # a cost that is none
+                               {"prompt_tokens": 600, "completion_tokens": 3,
+                                "completion_tokens_details": {"reasoning_tokens": "many"}})):
+        r = ask("orm", f"dropped {n}", http=Server(_usage_body(usage)).client())
+        settle = _settles(ledger)[-1]
+        assert r.usd == pytest.approx(r.projected_usd) and r.usd_source == "computed"
+        assert settle["id"] == _reserves(ledger)[-1]["id"] and settle["usd"] == pytest.approx(r.projected_usd)
+        for note in (r.raw["usd_note"], settle["note"]):
+            assert "not a token count" in note and "settled at its projection" in note, note
+        assert "unreconciled_attempts" not in r.raw  # settled: the call's cost is no longer open
+    # a usable cost is taken as before, checked only against the counts that were valid
+    priced = {"prompt_tokens": "600", "completion_tokens": 3, "cost": 0.001}
+    r = ask("orm", "dropped but priced", http=Server(_usage_body(priced)).client())
+    assert r.usd == 0.001 and r.usd_source == "provider" and "projection" not in r.raw["usd_note"]
+    low = {"prompt_tokens": "600", "completion_tokens": 15000, "cost": 0.0}  # below half of what 15000 out cost
+    r = ask("orm", "x" * 35, max_tokens=16000, http=Server(_usage_body(low)).client())
+    assert r.usd_source == "computed" and r.usd == pytest.approx((10 * 2.0 + 15000 * 10.0) / 1e6)
+    # a count that was not reported (null) is not a dropped one: the others still price the call
+    r = ask("orm", "hi", http=Server(_usage_body({"prompt_tokens": 600, "completion_tokens": None})).client())
+    assert r.usd == pytest.approx((600 * 2.0 + 4096 * 10.0) / 1e6) and r.usd != pytest.approx(r.projected_usd)
+    assert "not a token count" not in r.raw["usd_note"]

@@ -8,7 +8,10 @@ model's answer text (an answer is kept as the model wrote it).
 
 A key is cut in every form it can take in text: as written, and as JSON text holds
 it (``json.dumps(key)[1:-1]``, so a key with a quote or a backslash is also caught
-escaped; see :func:`secret_forms`).
+escaped; see :func:`secret_forms`). JSON can spell any character as an escape
+(``\\u0076`` for ``v``), so no text match catches every spelling: the router also
+cuts the key from an answer once it is parsed (``loopkit.router.core``, with
+:func:`cut_secret`).
 """
 
 from __future__ import annotations
@@ -124,19 +127,28 @@ def strip_secret(obj: Any, secret: str | None) -> Any:
     Lists, tuples and dicts are walked without recursion, so a deeply nested answer
     cannot raise here.
     """
+    return cut_secret(obj, secret)[0]
+
+
+def cut_secret(obj: Any, secret: str | None) -> tuple[Any, bool]:
+    """:func:`strip_secret`'s copy of ``obj``, and whether anything was cut (``secret`` was in it)."""
     if not isinstance(secret, str) or len(secret) < _MIN_SECRET_CHARS:
-        return obj
+        return obj, False
     forms = secret_forms(secret)
+    found = False
 
     def fix(value: Any) -> Any:
+        nonlocal found
         if not isinstance(value, str):
             return value
         for form in forms:
-            value = value.replace(form, REDACTED)
+            if form in value:
+                found = True
+                value = value.replace(form, REDACTED)
         return value
 
     if not isinstance(obj, (dict, list, tuple)):
-        return fix(obj)
+        return fix(obj), found
     root: Any = {} if isinstance(obj, dict) else []
     copies: dict[int, Any] = {id(obj): root}  # a shared or cyclic part is copied once and shared again
     stack: list[tuple[Any, Any]] = [(obj, root)]
@@ -156,7 +168,7 @@ def strip_secret(obj: Any, secret: str | None) -> Any:
                 dst[fix(k)] = new
             else:
                 dst.append(new)
-    return root
+    return root, found
 
 
 def has_secret(obj: Any, secret: str) -> bool:

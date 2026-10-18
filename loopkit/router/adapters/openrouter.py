@@ -47,7 +47,6 @@ from .base import (
     AdapterRequest,
     AdapterResult,
     as_cost,
-    as_int,
     check_url,
     error_text,
     reasoning_level,
@@ -167,10 +166,11 @@ def message_text(content: Any) -> str:
 def parse_usage(usage: Any) -> dict[str, Any]:
     """Token counts and cost from a chat-completions ``usage`` object.
 
-    ``cost`` is what the call cost: ``usage.cost`` plus, when it is reported,
-    ``usage.cost_details.upstream_inference_cost`` (a BYOK account's provider
-    charge, which ``usage.cost`` leaves out). ``usage_cost`` is ``usage.cost`` as
-    reported.
+    The token counts are returned as reported (None when absent): chat() drops a value
+    that is not a count, with a note that names it. ``cost`` is what the call cost:
+    ``usage.cost`` plus, when it is reported, ``usage.cost_details.upstream_inference_cost``
+    (a BYOK account's provider charge, which ``usage.cost`` leaves out). ``usage_cost`` is
+    ``usage.cost`` as reported.
     """
     usage = usage if isinstance(usage, dict) else {}
     out_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
@@ -183,10 +183,10 @@ def parse_usage(usage: Any) -> dict[str, Any]:
     if upstream is not None:
         total = (reported or 0.0) + upstream
     return {
-        "input_tokens": as_int(usage.get("prompt_tokens")),
-        "output_tokens": as_int(usage.get("completion_tokens")),
-        "reasoning_tokens": as_int(out_details.get("reasoning_tokens")),
-        "cached_tokens": as_int(in_details.get("cached_tokens")),
+        "input_tokens": usage.get("prompt_tokens"),
+        "output_tokens": usage.get("completion_tokens"),
+        "reasoning_tokens": out_details.get("reasoning_tokens"),
+        "cached_tokens": in_details.get("cached_tokens"),
         "cost": total,
         "usage_cost": reported,
         "upstream_inference_cost": upstream,

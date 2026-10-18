@@ -14,9 +14,12 @@ Run semantics, which the interpreter follows:
 * ``max_visits`` (node): a node visited more than ``max_visits`` times fails
   without running and takes its failure edge. That is how a loop through edges
   ends, so the validator removes the success edges of every node that sets
-  ``max_visits`` (and the edges out of terminal nodes, which a run never takes)
-  and reports each group of loops that is left (``unbounded_cycle``), naming
-  every node in it.
+  ``max_visits`` and reports each group of loops that is left
+  (``unbounded_cycle``), naming its nodes (the first 20 of a larger group, and
+  how many more).
+* A run ends at a terminal node, so an edge out of one is never taken:
+  ``terminal_has_edges`` reports it, and the reachability, ref and loop checks
+  leave it out.
 * A node's outputs exist only after it succeeds. A ref from node R to node S is
   valid only if every path from the entry to R leaves S through a success edge.
 * Following success edges from the entry must reach a done node.
@@ -38,6 +41,7 @@ import heapq
 import json
 import math
 import re
+import sys
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
@@ -59,7 +63,7 @@ MAX_RETRIES_LIMIT = 10
 MAX_VISITS_LIMIT = 50
 MAX_PARAM_DEPTH = 32
 REF_FORM = '{"ref": "<node_id>.<field>"}'
-_MAX_INDEX_DIGITS = 9  # a longer item number in a ref path is out of range for any list
+_MAX_INDEX_DIGITS = 9  # an item number in a ref path with more digits (leading zeros aside) is out of range
 
 GRAPH_FORMAT_HINT = (
     'The top level is {"nodes": [...], "edges": [...], "entry": "<node id>", "max_retries": 1, '
@@ -320,6 +324,7 @@ _KNOWN_FIELDS = frozenset(ProgramGraph.model_fields) | frozenset(Node.model_fiel
 # A fenced block: ``` and the rest of its line (a language tag, say), then the body up to the next ```.
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 _MAX_OBJECT_STARTS = 50  # "{" positions tried as the start of the graph in a reply with prose around it
+_SCAN_PER_CHAR = 4       # characters those tries may decode in all, per character of the reply (nested broken JSON)
 
 
 def _fenced_blocks(text: str) -> Iterator[str]:
@@ -372,7 +377,7 @@ def _unreadable(exc: BaseException) -> GraphError:
 def _prose_brace(exc: json.JSONDecodeError, start: int) -> bool:
     """The "{" at ``start`` opened prose such as ``{curly}``, not JSON: the parse failed at its first key and a
     "}" closes it before the next "{". A failure further in, or a brace nested in it, means broken JSON (cut
-    off, single-quoted, a raw newline in a string), whose inner objects are fragments, not the graph."""
+    off, single-quoted, a raw newline in a string): that error is the one to report."""
     text = exc.doc
     if not exc.msg.startswith("Expecting property name") or text[start + 1:exc.pos].strip():
         return False
@@ -381,10 +386,13 @@ def _prose_brace(exc: json.JSONDecodeError, start: int) -> bool:
 
 
 def _load_json(text: str) -> tuple[Any, GraphError | None]:
-    """The JSON value in a writer's reply: the whole text, else a fenced block, else the outermost object.
+    """The JSON value in a writer's reply: the whole text, else a fenced block, else the graph object in it.
 
-    The object may follow prose with braces in it: while the "{" tried last opened prose (``_prose_brace``),
-    the next one is tried, at most 50 in all.
+    Prose before the graph may hold braces (``{curly}``) or JSON of its own (``{}``, a ref): of the first 50
+    "{" in the text, the first that starts an object with a "nodes" key is the graph. When none does, the
+    first broken object is reported (``_prose_brace`` says it is not prose), else what the first "{"
+    starts: its JSON error, or the object, whose missing fields are then reported. The tries stop once they
+    have decoded four times the text, so a reply of nested broken objects is not decoded 50 times over.
     """
     if text.startswith("\ufeff"):
         text = text[1:]
@@ -405,24 +413,32 @@ def _load_json(text: str) -> tuple[Any, GraphError | None]:
         except (ValueError, RecursionError) as exc:
             return None, _unreadable(exc)
     decoder = json.JSONDecoder()
+    first: Any = error  # what the first "{" starts (a JSON error or an object); the text's own error if none
+    broken: json.JSONDecodeError | None = None
+    scanned, budget = 0, _SCAN_PER_CHAR * len(body)
     start = body.find("{")
-    first: json.JSONDecodeError | None = None
-    for _ in range(_MAX_OBJECT_STARTS):
-        if start < 0:
+    for tried in range(_MAX_OBJECT_STARTS):
+        if start < 0 or scanned > budget:
             break
         try:
-            value, _end = decoder.raw_decode(body, start)
+            found, end = decoder.raw_decode(body, start)
         except json.JSONDecodeError as exc:
-            if not _prose_brace(exc, start):
-                return None, _json_error(exc)
-            first = first or exc
+            found, end = exc, exc.pos
+            if broken is None and not _prose_brace(exc, start):
+                broken = exc
         except (ValueError, RecursionError) as exc:
             return None, _unreadable(exc)
-        else:
-            if isinstance(value, dict):
-                return value, None
+        if isinstance(found, dict) and "nodes" in found:
+            return found, None
+        if tried == 0:
+            first = found
+        scanned += end - start
         start = body.find("{", start + 1)
-    return None, _json_error(first or error)
+    if broken is not None:
+        return None, _json_error(broken)
+    if isinstance(first, json.JSONDecodeError):
+        return None, _json_error(first)
+    return first, None
 
 
 def _kind_phrase(value: Any) -> str:
@@ -595,7 +611,8 @@ def _lenient_copy(exc: ValidationError, data: dict[str, Any]) -> dict[str, Any] 
 
 # ------------------------------------------------------------------ validation
 _LOOP_DETAIL_NODES = 64    # a larger group of loops gets the rule for one bound, not the node that ends them all
-_SUGGESTED_IDS = 5         # node ids listed in the fix for a ref to an unknown node
+_LISTED_IDS = 20           # node ids a loop message lists at most, then how many more
+_SUGGESTED_IDS = 5         # node ids listed in the fix for an unknown node id (in a ref, an edge or the entry)
 _SUGGEST_COMPARES = 2000   # difflib comparisons per validation run, then a cheap guess (about 0.5 s at worst)
 _COMPARED_CHARS = 64       # characters of a name compared (a node id has at most 64)
 _CLOSE_ENOUGH = 0.6        # difflib's cutoff for "Did you mean"
@@ -663,37 +680,55 @@ def _sccs(nodes: list[str], adjacency: dict[str, list[str]]) -> list[list[str]]:
     return out
 
 
-def _cycle_from(start: str, members: set[str], adjacency: dict[str, list[str]]) -> list[str]:
-    """A concrete cycle start -> ... -> (back to start) inside one strongly connected component, by DFS."""
-    stack = [(start, iter(adjacency.get(start, [])))]
-    seen = {start}
-    while stack:
-        v, it = stack[-1]
-        for w in it:
-            if w not in members:
-                continue
+def _shortest_loop(start: str, members: set[str], adjacency: dict[str, list[str]]) -> list[str]:
+    """A shortest loop start -> ... -> (back to start) inside one strongly connected component, by breadth-first
+    search (a depth-first one can walk through every node of a large group before it closes a loop)."""
+    parent: dict[str, str | None] = {start: None}
+    queue = deque([start])
+    while queue:
+        v = queue.popleft()
+        for w in adjacency.get(v, []):
             if w == start:
-                return [x for x, _ in stack]
-            if w not in seen:
-                seen.add(w)
-                stack.append((w, iter(adjacency.get(w, []))))
-                break
-        else:
-            stack.pop()
+                loop: list[str] = []
+                at: str | None = v
+                while at is not None:
+                    loop.append(at)
+                    at = parent[at]
+                return loop[::-1]
+            if w in members and w not in parent:
+                parent[w] = v
+                queue.append(w)
     return [start]
 
 
+def _listed(names: list[str], sep: str = ", ") -> str:
+    """``names`` joined with ``sep``: the first 20, then "and N more"."""
+    if len(names) <= _LISTED_IDS:
+        return sep.join(names)
+    return f"{sep.join(names[:_LISTED_IDS])} and {len(names) - _LISTED_IDS} more"
+
+
+def _loop_text(loop: list[str]) -> str:
+    """``a -> b -> a``. A loop of more than 20 nodes shows its first 19, how many more, and its last node, whose
+    edge closes the loop."""
+    if len(loop) <= _LISTED_IDS:
+        return " -> ".join(loop + loop[:1])
+    return " -> ".join(loop[:_LISTED_IDS - 1] + [f"({len(loop) - _LISTED_IDS} more)", loop[-1], loop[0]])
+
+
 Admits = Callable[[str, Any], bool]  # (ref, the schema at its position) -> can the ref's value go there
+Misfits = Callable[[Any, Any], int]  # (value, the schema at its position) -> refs in it that cannot go there
+_ANY: dict[str, Any] = {}  # the schema of a position no schema describes (shared, never changed)
 
 
-def _container(schema: Any, root: dict[str, Any], value: Any, admits: Admits | None = None) -> dict[str, Any]:
+def _container(schema: Any, root: dict[str, Any], value: Any, misfits: Misfits | None = None) -> dict[str, Any]:
     """The schema that describes the dict or list ``value`` at its position (through $ref, unions and allOf).
 
     Of a union's branches that fit the value's kind, the first one the value passes (refs count as
-    wildcards) is used, else the first that fits. With ``admits``, it is the first passing branch that
-    admits every ref inside the value, so a ref is typed against a branch that can take it; when no
-    passing branch admits them all, the first passing one is used and the refs that do not fit it are
-    reported there.
+    wildcards) is used, else the first that fits. With ``misfits``, it is the passing branch with the
+    fewest refs inside the value that cannot go where the branch puts them (the first such branch), so a
+    ref is typed against a branch that can take it, and when no branch takes them all, the fewest
+    mismatches are reported.
     """
     s = resolve(schema, root) if isinstance(schema, dict) else {}
     kind = "object" if isinstance(value, dict) else "array"
@@ -705,8 +740,14 @@ def _container(schema: Any, root: dict[str, Any], value: Any, admits: Admits | N
             if not fits:
                 return {}
             passing = [b for b in fits if not check_schema(value, b, root=root, wildcard=is_ref)]
-            if admits is not None and len(passing) > 1:
-                s = next((b for b in passing if _admits_refs(value, b, root, admits)), passing[0])
+            if misfits is not None and len(passing) > 1:
+                s, fewest = passing[0], -1
+                for b in passing:
+                    count = misfits(value, b)
+                    if fewest < 0 or count < fewest:
+                        s, fewest = b, count
+                    if count == 0:
+                        break
             else:
                 s = (passing or fits)[0]
             continue
@@ -731,32 +772,73 @@ def _item_schemas(s: dict[str, Any]) -> tuple[list[Any], Any]:
     return (prefix if isinstance(prefix, list) else []), items
 
 
-def _ref_slots(value: Any, schema: Any, root: dict[str, Any], path: str,
-               admits: Admits | None = None) -> Iterator[tuple[str, Any, str]]:
-    """(ref, the schema at the ref's position, its param path) for every ref in a param value.
-
-    ``admits`` picks union branches as ``_container`` says.
-    """
-    if is_ref(value):
-        yield value["ref"], schema, path
-    elif isinstance(value, dict):
-        s = _container(schema, root, value, admits)
+def _members(value: Any, s: dict[str, Any]) -> Iterator[tuple[Any, Any, str]]:
+    """(item, the schema at its position, its step in a param path) for each item of the dict or list
+    ``value``, whose own schema is ``s``."""
+    if isinstance(value, dict):
         props = s.get("properties") if isinstance(s.get("properties"), dict) else {}
-        extra = s.get("additionalProperties")
+        extra = s.get("additionalProperties") if isinstance(s.get("additionalProperties"), dict) else _ANY
         for key, item in value.items():
-            sub = props[key] if key in props else (extra if isinstance(extra, dict) else {})
-            yield from _ref_slots(item, sub, root, f"{path}.{key}", admits)
-    elif isinstance(value, (list, tuple)):
-        s = _container(schema, root, value, admits)
+            yield item, props[key] if key in props else extra, f".{key}"
+    else:
         prefix, items = _item_schemas(s)
+        rest = items if isinstance(items, dict) else _ANY
         for i, item in enumerate(value):
-            sub = prefix[i] if i < len(prefix) else (items if isinstance(items, dict) else {})
-            yield from _ref_slots(item, sub, root, f"{path}[{i}]", admits)
+            yield item, prefix[i] if i < len(prefix) else rest, f"[{i}]"
 
 
-def _admits_refs(value: Any, schema: dict[str, Any], root: dict[str, Any], admits: Admits) -> bool:
-    """Every ref inside ``value`` can go where ``schema`` puts it."""
-    return all(admits(ref, slot) for ref, slot, _path in _ref_slots(value, schema, root, "", admits))
+class _RefTyping:
+    """Where each ref in one param value stands: the schema at its position, with union branches picked as
+    ``_container`` says with misfits (``admits`` says whether a ref can go where a schema puts it).
+
+    The schema of each (schema, value) pair and its misfit count are worked out once per param, so a value
+    nested in unions takes polynomial time. Picking a branch used to walk the whole subtree once per passing
+    branch at every nested union, which was exponential in the nesting depth.
+    """
+
+    def __init__(self, root: dict[str, Any], admits: Admits) -> None:
+        self.root = root
+        self.admits = admits
+        # (id(schema), id(value)) -> (schema, value, result). An entry holds both objects, so no other object
+        # can take either id while the memo is in use.
+        self._schemas: dict[tuple[int, int], tuple[Any, Any, dict[str, Any]]] = {}
+        self._misfits: dict[tuple[int, int], tuple[Any, Any, int]] = {}
+
+    def container(self, schema: Any, value: Any) -> dict[str, Any]:
+        """The schema of the dict or list ``value`` at a position whose schema is ``schema``."""
+        key = (id(schema), id(value))
+        if key not in self._schemas:
+            self._schemas[key] = (schema, value, _container(schema, self.root, value, self.misfits))
+        return self._schemas[key][2]
+
+    def misfits(self, value: Any, schema: Any) -> int:
+        """How many refs in ``value`` cannot go where ``schema``, the schema at its position, puts them."""
+        if not isinstance(value, (dict, list, tuple)):
+            return 0
+        key = (id(schema), id(value))
+        if key not in self._misfits:
+            if is_ref(value):
+                count = 0 if self.admits(value["ref"], schema) else 1
+            else:
+                s = self.container(schema, value)
+                count = sum(self.misfits(item, sub) for item, sub, _step in _members(value, s))
+            self._misfits[key] = (schema, value, count)
+        return self._misfits[key][2]
+
+    def slots(self, value: Any, schema: Any, path: str) -> Iterator[tuple[str, Any, str]]:
+        """(ref, the schema at the ref's position, its param path) for every ref in ``value``, in order."""
+        if is_ref(value):
+            yield value["ref"], schema, path
+        elif isinstance(value, (dict, list, tuple)):
+            for item, sub, step in _members(value, self.container(schema, value)):
+                yield from self.slots(item, sub, path + step)
+
+
+def _int_readable(digits: str) -> bool:
+    """int() can read ``digits``: it refuses more than sys.get_int_max_str_digits() digits (4300 unless changed),
+    leading zeros included, and the interpreter reads an item number with int()."""
+    limit = sys.get_int_max_str_digits()
+    return limit == 0 or len(digits) <= limit
 
 
 def _resolve_path(schema: Any, root: dict[str, Any], segments: list[str]) -> tuple[Any, tuple[int, str, Any] | None]:
@@ -800,11 +882,12 @@ def _resolve_path(schema: Any, root: dict[str, Any], segments: list[str]) -> tup
                 return None, (i, "index", None)
             hi = s.get("maxItems")
             prefix, items = _item_schemas(s)
-            if len(seg) > _MAX_INDEX_DIGITS:  # past any list a skill returns; int() refuses 4301 digits
+            digits = seg.lstrip("0") or "0"  # the interpreter reads an item number with int(): 007 is item 7
+            if len(digits) > _MAX_INDEX_DIGITS or not _int_readable(seg):  # past any list a skill returns
                 if is_number(hi) and hi <= 10 ** _MAX_INDEX_DIGITS:
                     return None, (i, "range", int(hi))
                 return None, (i, "range", len(prefix) if prefix and items is False else None)
-            idx = int(seg)
+            idx = int(digits)
             if is_number(hi) and idx >= hi:
                 return None, (i, "range", int(hi))
             if idx < len(prefix):
@@ -894,7 +977,8 @@ class _Validator:
         return self._fixes[key]
 
     def node_fix(self, name: str) -> str:
-        """The node ids closest to the unknown ``name``, at most five. Once per distinct name."""
+        """The node ids closest to the unknown ``name`` (in a ref, an edge or the entry), at most five. Once per
+        distinct name."""
         key = ("node", name)
         if key not in self._fixes:
             if self._sorted_ids is None:
@@ -943,7 +1027,7 @@ class _Validator:
                 self.by_id[n.id] = n
         if self.graph.entry not in self.by_id:
             self.add("unknown_entry", None, f"entry '{self.graph.entry}' is not a node id",
-                     f"Set entry to the first node to run, one of: {', '.join(self.by_id)}")
+                     f"Set entry to the first node to run. {self.node_fix(self.graph.entry)}")
 
     def check_skills(self) -> None:
         pool = self.allowed if self.allowed is not None else self.specs
@@ -987,15 +1071,15 @@ class _Validator:
                          f"Add '{n.id}' to terminal_nodes")
 
     def check_edges(self) -> None:
-        ids = ", ".join(self.by_id)
         for e in self.graph.edges:
             label = f"edge {e.src} -> {e.dst} ({e.on})"
             if e.src not in self.by_id:
                 self.add("unknown_edge_node", None, f"{label} starts at '{e.src}', which is not a node",
-                         f"Edges connect existing node ids: {ids}")
+                         f"Edges connect existing node ids. {self.node_fix(e.src)}")
             if e.dst not in self.by_id:
                 self.add("unknown_edge_node", e.src if e.src in self.by_id else None,
-                         f"{label} points to '{e.dst}', which is not a node", f"Edges connect existing node ids: {ids}")
+                         f"{label} points to '{e.dst}', which is not a node",
+                         f"Edges connect existing node ids. {self.node_fix(e.dst)}")
             if e.src in self.by_id and self.is_terminal(self.by_id[e.src]):
                 self.add("terminal_has_edges", e.src, f"terminal node '{e.src}' has an outgoing {e.on} edge",
                          "A done or abort node ends the program. Remove edges that start at it")
@@ -1016,11 +1100,15 @@ class _Validator:
                          f'Add {{"src": "{n.id}", "dst": "<a recovery node or an abort node>", "on": "failure"}}')
 
     def reach(self, starts: Iterable[str | None], skip: tuple[str, str] | None = None) -> set[str]:
-        """Nodes reachable from ``starts`` (included) over the graph's edges, never taking ``skip``."""
+        """Nodes reachable from ``starts`` (included) over the graph's edges, never taking ``skip``. A run ends at a
+        terminal node, so the edges out of one are not followed (terminal_has_edges reports them). The
+        unreachable check and the ref rule (``succeeds_before``) both use this."""
         seen = {s for s in starts if s in self.by_id}
         queue = deque(seen)
         while queue:
             v = queue.popleft()
+            if self.is_terminal(self.by_id[v]):
+                continue
             for on in ("success", "failure"):
                 if (v, on) == skip:
                     continue
@@ -1093,19 +1181,20 @@ class _Validator:
 
     def report_loops(self, members: list[str], reduced: dict[str, list[str]], bounded: set[str]) -> None:
         """One unbounded_cycle for a strongly connected component of the reduced graph (``members`` in
-        declaration order), with a concrete loop of it as the example."""
+        declaration order), with a shortest loop through its first node as the example. Each list of nodes
+        stops at 20, so the 'one of several loops' wording and the rule for a large group stay in the part of
+        the line that format_errors keeps."""
         inside = set(members)
-        cycle = _cycle_from(members[0], inside, reduced)
-        text = " -> ".join(cycle + [cycle[0]])
-        held = [c for c in cycle if c in bounded]
+        loop = _shortest_loop(members[0], inside, reduced)
+        text = _loop_text(loop)
+        held = [f"'{c}'" for c in loop if c in bounded]
         if held:
-            names = ", ".join(f"'{c}'" for c in held)
             why = (f"form a loop that max_visits cannot end: past its bound a node fails without running and "
-                   f"takes its failure edge, and the failure edge of {names} stays in this loop")
+                   f"takes its failure edge, and the failure edge of {_listed(held)} stays in this loop")
         else:
             why = "form a loop with no visit bound"
         if all(sum(w in inside for w in reduced[v]) == 1 for v in members):  # the component is that one loop
-            self.add("unbounded_cycle", cycle[0], f"nodes {text} {why}", _CYCLE_FIX)
+            self.add("unbounded_cycle", loop[0], f"nodes {text} {why}", _CYCLE_FIX)
             return
         rule = ("One max_visits ends them all only on a node that every loop runs through and whose failure edge "
                 "leaves all of the loops")
@@ -1113,13 +1202,12 @@ class _Validator:
         if enders is None:
             ending = rule
         elif enders:
-            names = " or ".join(f"'{v}'" for v in enders)
+            names = _listed([f"'{v}'" for v in enders], " or ")
             ending = f"{rule}: here that is {names}"
         else:
             ending = f"{rule}, and no node here is one, so set max_visits on a node of each loop"
-        self.add("unbounded_cycle", cycle[0],
-                 f"nodes {text} {why}, one of several loops among the nodes {', '.join(members)}. {ending}",
-                 _LOOPS_FIX)
+        self.add("unbounded_cycle", loop[0],
+                 f"nodes {text} {why}, one of several loops among the nodes {_listed(members)}. {ending}", _LOOPS_FIX)
 
     def loop_enders(self, members: list[str], inside: set[str], reduced: dict[str, list[str]],
                     bounded: set[str]) -> list[str] | None:
@@ -1180,8 +1268,8 @@ class _Validator:
             head = f"Did you mean '{close[0]}'? " if close else ""
             self.add("unknown_param", n.id, f"node '{n.id}' ({n.skill}) has an unknown param '{name}'",
                      f"{head}{n.skill} takes: {', '.join(props) or 'no params'}")
-        admits = partial(self.ref_fits, node=n, root=schema)
-        for ref, slot, path in _ref_slots(value, sub if sub is not None else {}, schema, name, admits):
+        typing = _RefTyping(schema, partial(self.ref_fits, node=n, root=schema))
+        for ref, slot, path in typing.slots(value, sub if sub is not None else _ANY, name):
             err = self.check_ref(ref, n, path, slot, schema)
             if err is not None:
                 self.errors.append(err)

@@ -6,7 +6,8 @@ Order of operations for one call:
    (ModelNotConfigured); so is an elorian entry without a base_url, or a base_url or
    endpoint that is not usable: checked as written (leading or trailing whitespace,
    any space or control character is refused) and as the exact URL the adapter will
-   send (httpx must parse it, http or https, with a real host).
+   send (httpx must parse it, http or https, with a real host and a port from 1 to
+   65535).
 2. Normalize messages and images. ``json_schema``, ``extra`` and the reasoning
    setting become plain JSON (numpy scalars and arrays turn into numbers and lists),
    so the request body always serializes. Hash the canonical request: adapter, model
@@ -45,11 +46,15 @@ Order of operations for one call:
    in ``raw``); else it is computed from tokens (``computed``), adding reasoning
    tokens unless the adapter counts them inside the output, and taking a count that
    was not reported from the projection. A token count that is not a whole number
-   from 0 to below 10**12 is treated as not reported, with a note. A cost that is not
-   a finite number, or that cannot be computed at all, settles at the projection.
-9. With a JSON schema, the answer is parsed (code fences and leading prose dropped)
-   and validated. Any parse or validation failure becomes ``Response.json_error``,
-   never an exception. No repair here.
+   from 0 to below 10**12 (a negative or fractional number, a string, a bool, a list,
+   NaN, ``10**400``) is treated as not reported, with a note naming it in
+   ``raw["usd_note"]`` and the ledger; when one was and the provider gave no usable
+   cost, the call settles at its projection (the cautious choice: the counts left are
+   not trusted to price it). A cost that is not a finite number, or that cannot be
+   computed at all, settles at the projection.
+9. With a JSON schema, the answer is parsed (code fences and leading prose dropped,
+   in linear time whatever the text) and validated. Any parse or validation failure
+   becomes ``Response.json_error``, never an exception. No repair here.
 10. A successful answer is cached; a generation that failed upstream (finish_reason
     "error") raises ModelCallError and is never cached. One ``model_call`` trace
     event is emitted per call, also when something fails after the provider was
@@ -63,7 +68,13 @@ Key safety: every string that comes back from the provider (the answer, its mode
 name, finish reason, generation id and upstream provider, the attempt log) has the
 key cut in each of its forms (as written and JSON-escaped) before it reaches the
 Response, the trace, the cache or an error. An answer returned as data (Jev's
-answers) has its text rebuilt as ``json.dumps`` of the scrubbed value.
+answers) has its text rebuilt as ``json.dumps`` of the scrubbed value. JSON text can
+spell the key with other escapes too (``\\u0076`` for ``v``), which parsing decodes:
+so a parsed answer has the key cut from every string (dict keys included) before it
+is validated, ``json_error`` has it cut as well, and when the parsed value held the
+key the text is rebuilt the same way, so the cache never keeps a spelling that a
+cache hit would decode again. Error text is redacted before it is cut to length, so
+a key across the cut cannot survive as a prefix.
 
 Trace and Response accounting: ``usd`` is the answer's cost on success (the
 ledger's count for the call on failure). ``ledger_usd`` is everything the ledger
@@ -95,7 +106,6 @@ from .adapters.base import (
     AdapterRequest,
     AdapterResult,
     as_cost,
-    as_int,
     reasoning_level,
 )
 from .cache import DiskCache
@@ -103,7 +113,7 @@ from .errors import ModelCallError, ModelNotConfigured, RouterError
 from .http import HttpClient, default_client
 from .ledger import Ledger, check_label
 from .media import normalize_images
-from .redact import redact, scrub, strip_secret
+from .redact import cut_secret, redact, scrub, strip_secret
 
 ROLES = ("writer", "reader", "system1")
 MESSAGE_ROLES = ("system", "user", "assistant")
@@ -345,8 +355,11 @@ def clean_token_counts(result: Any) -> list[str]:
     """Set each token count of ``result`` that is not a count to None (not reported), with a note for each.
 
     A count is a whole number from 0 to below 10**12 (an integral float, or a numpy
-    integer, is taken as its int). Anything else, for example ``10**400``, ``1e300``,
-    a negative number or a string, would break or distort the cost, so it is dropped.
+    integer, is taken as its int). Anything else would break or distort the cost, so
+    it is dropped: ``10**400``, ``1e300``, a negative or fractional number, NaN,
+    infinity, a bool, a string, a list or an object. The adapters pass the counts as
+    the provider reported them, so every one of these gets its note. Returns the
+    notes: one per count dropped, none when every count was a count or missing.
     """
     notes: list[str] = []
     for name in TOKEN_COUNT_FIELDS:
@@ -354,12 +367,14 @@ def clean_token_counts(result: Any) -> list[str]:
         if value is None:
             continue
         count: int | None = None
-        if not isinstance(value, bool):
+        if isinstance(value, float):
+            if math.isfinite(value) and value.is_integer():
+                count = int(value)
+        elif not isinstance(value, bool):
             try:
                 count = operator.index(value)  # int, numpy integers
-            except TypeError:
-                if isinstance(value, float) and math.isfinite(value) and value.is_integer():
-                    count = int(value)
+            except Exception:  # noqa: BLE001 - a str, a list, a dict, an object whose __index__ fails: not a count
+                count = None
         if count is not None and 0 <= count < MAX_TOKEN_COUNT:
             if type(value) is not int:
                 setattr(result, name, int(count))
@@ -424,12 +439,16 @@ def cost_known(result: AdapterResult) -> bool:
 
 
 def settled_cost(result: AdapterResult, entry: ModelEntry, models: ModelsConfig, projected: float,
-                 est_in: int, max_tokens: int) -> tuple[float, str, list[str]]:
+                 est_in: int, max_tokens: int, *, dropped: bool = False) -> tuple[float, str, list[str]]:
     """(usd, usd_source, notes) for a call that returned. ``max_tokens`` is the output allowance.
 
     A provider cost below half of what the token counts it reported cost (a count it
     left out counts as 0) is not trusted: the call is settled at the computed cost,
-    which takes a missing count from the projection.
+    which takes a missing count from the projection. ``dropped`` says the provider
+    sent a token count that was not a count (:func:`clean_token_counts` dropped it):
+    with no usable cost the call is then settled at its projection, the cautious
+    choice, since the counts left are not trusted to price it. A usable cost is still
+    taken, checked against the counts that were valid.
     """
     notes: list[str] = []
     computed, computed_notes = _token_cost(result, entry, models, est_in, max_tokens)
@@ -437,6 +456,10 @@ def settled_cost(result: AdapterResult, entry: ModelEntry, models: ModelsConfig,
     if result.usd is not None and reported is None:
         notes.append(f"the provider's cost ({_describe(result.usd)}) is not a finite non-negative number and was "
                      "ignored")
+    if reported is None and dropped:
+        notes.append("a token count the provider sent is not a count and it reported no usable cost, so the call is "
+                     "settled at its projection (the cautious choice)")
+        return float(projected), "computed", notes
     if reported is not None:
         floor, _floor_notes = _token_cost(result, entry, models, est_in, max_tokens, fill_missing=False)
         if floor is not None and math.isfinite(floor) and reported < PROVIDER_COST_FLOOR * floor:
@@ -463,7 +486,34 @@ def settled_cost(result: AdapterResult, entry: ModelEntry, models: ModelsConfig,
 
 
 # --------------------------------------------------------------------------- JSON answers
-_FENCE_RE = re.compile(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n?(.*?)```", re.DOTALL)
+_FENCE = "```"
+#: what may follow an opening fence: spaces or tabs, a language tag, spaces or tabs, then \r and \n
+_FENCE_INFO_RE = re.compile(r"[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n?")
+
+
+def _fenced_blocks(text: str) -> list[str]:
+    r"""The bodies of ``text``'s fenced code blocks, in order, in linear time.
+
+    They are the bodies ``re.finditer(r"```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n?(.*?)```", text, re.DOTALL)``
+    gives, the pattern used before. That pattern backtracks cubically: for each way of
+    splitting a run of spaces between its two ``[ \t]*`` it scans to the end of the
+    text for a closing fence, so a fence and 2,000 spaces with none took seconds. Here
+    each fence is found with str.find, its info part is matched where it stands
+    (nothing follows it in the pattern, so it never backtracks) and the body runs to
+    the next fence. The first fence with no fence after its info part ends the search:
+    the info part holds no backtick, so a later fence's body cannot start any earlier,
+    and no fence follows.
+    """
+    bodies: list[str] = []
+    start = text.find(_FENCE)
+    while start >= 0:
+        body = _FENCE_INFO_RE.match(text, start + len(_FENCE)).end()
+        close = text.find(_FENCE, body)
+        if close < 0:
+            break
+        bodies.append(text[body:close])
+        start = text.find(_FENCE, close + len(_FENCE))
+    return bodies
 
 
 def _clip(text: str, n: int = 160) -> str:
@@ -519,8 +569,8 @@ def parse_json_text(text: str | None) -> tuple[Any, str | None]:
         if text is None or not str(text).strip():
             return None, "empty answer"
         s = str(text).strip()
-        candidates = [m.group(1) for m in _FENCE_RE.finditer(s)]
-        if s.startswith("```") and not candidates:  # an opening fence the answer never closed (truncated)
+        candidates = _fenced_blocks(s)
+        if s.startswith(_FENCE) and not candidates:  # an opening fence the answer never closed (truncated)
             body = s[3:]
             newline = body.find("\n")
             candidates.append(body[newline + 1:] if newline >= 0 else body)
@@ -552,6 +602,7 @@ def validate_json(value: Any, schema: dict[str, Any]) -> str | None:
 
 
 def _json_result(text: str, json_value: Any, json_schema: dict[str, Any] | None) -> tuple[Any, str | None]:
+    """(value, json_error) for a cached answer (its text holds no form of the key: see :func:`_fresh_json`)."""
     try:
         if json_schema is not None:
             value, err = parse_json_text(text)
@@ -563,6 +614,45 @@ def _json_result(text: str, json_value: Any, json_schema: dict[str, Any] | None)
         return None, None
     except Exception as exc:  # noqa: BLE001 - never raise after a paid call
         return None, f"could not read the answer as JSON: {type(exc).__name__}: {_clip(str(exc))}"
+
+
+def _rebuilt_text(value: Any) -> str:
+    """``json.dumps`` of a parsed answer that held the key, or "" when it cannot be written (never cached).
+
+    Never the answer's own text, which spells the key in a form a parse decodes.
+    """
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError, RecursionError):
+        return ""
+
+
+def _fresh_json(text: str, json_value: Any, json_schema: dict[str, Any] | None,
+                key: str) -> tuple[str, Any, str | None]:
+    """(text, value, json_error) for an answer just received, with the key in none of them. Never raises.
+
+    The text arrives with the key cut as written and JSON-escaped, but JSON can spell
+    it with other escapes (``\\u0076`` for ``v``, ``\\u0022`` for a quote) that parsing
+    decodes. So the parsed value has the key cut from every string, dict keys
+    included, before it is validated (a validation message quotes a value cut to 60
+    characters, which could keep part of the key), and ``json_error`` has it cut too.
+    When the value held the key, the text becomes ``json.dumps`` of the scrubbed
+    value, so neither the Response nor the cache keeps a spelling that a later parse
+    (every cache hit) would decode again.
+    """
+    if json_schema is None:
+        return text, json_value, None
+    try:
+        value, error = parse_json_text(text)
+        if error is None:
+            value, found = cut_secret(value, key)
+            if found:
+                text = _rebuilt_text(value)
+            error = validate_json(value, json_schema)
+    except Exception as exc:  # noqa: BLE001 - never raise after a paid call
+        value, error = None, (f"could not read the answer as JSON: {type(exc).__name__}: "
+                              f"{_clip(strip_secret(str(exc), key))}")
+    return text, value, strip_secret(error, key)
 
 
 def _text_chars(msgs: list[dict[str, str]], json_schema: dict[str, Any] | None, extra: dict[str, Any]) -> int:
@@ -729,13 +819,10 @@ def _failed_call_cost(exc: ModelCallError, adapter: Adapter, entry: ModelEntry, 
                       projected: float, est_in: int, max_out: int) -> tuple[float, str, list[str]]:
     """The cost of a failed call that reported one, checked against its token counts like any other."""
     usage = exc.raw.get("usage") if isinstance(exc.raw, dict) and isinstance(exc.raw.get("usage"), dict) else {}
-    probe = AdapterResult(text="", input_tokens=as_int(usage.get("input_tokens")),
-                          output_tokens=as_int(usage.get("output_tokens")),
-                          reasoning_tokens=as_int(usage.get("reasoning_tokens")),
-                          cached_tokens=as_int(usage.get("cached_tokens")), usd=exc.usd,
-                          reasoning_in_output=adapter.reasoning_in_output)
+    probe = AdapterResult(text="", usd=exc.usd, reasoning_in_output=adapter.reasoning_in_output,
+                          **{name: usage.get(name) for name in TOKEN_COUNT_FIELDS})  # as reported, like an answer's
     notes = clean_token_counts(probe)
-    usd, source, cost_notes = settled_cost(probe, entry, models, projected, est_in, max_out)
+    usd, source, cost_notes = settled_cost(probe, entry, models, projected, est_in, max_out, dropped=bool(notes))
     return usd, source, notes + cost_notes
 
 
@@ -777,8 +864,9 @@ def _after_answer(exc: BaseException, model_key: str, model_id: str, label: str,
     """
     if isinstance(exc, RouterError) or not isinstance(exc, Exception):
         return exc
+    # redacted before it is cut to length: a key across the cut would otherwise survive as a prefix
     return RouterError(redact(f"{model_key} ({model_id}) via {label}: the provider answered, but the router failed "
-                              f"after the call ({type(exc).__name__}: {_clip(str(exc), 300)})", key))
+                              f"after the call ({type(exc).__name__}: {_clip(redact(str(exc), key), 300)})", key))
 
 
 # --------------------------------------------------------------------------- trace
@@ -990,11 +1078,12 @@ def chat(model_key: str, messages: list[dict] | str, images: list | None = None,
         error = sent_error
         if spend.answered and isinstance(error, Exception) and not isinstance(error, RouterError):
             # the provider answered but the adapter could not read the answer: a ModelCallError, never anything
-            # else; the answered attempt stays counted at its projection, because its cost was never read
+            # else; the answered attempt stays counted at its projection, because its cost was never read. The
+            # error text is redacted before it is cut to length, so a key across the cut cannot leave a prefix.
             error = ModelCallError(
                 redact(f"{model_key} ({model_id}) via {adapter.label}: the provider answered (HTTP "
                        f"{spend.answered_status}), but the answer could not be read ({type(sent_error).__name__}: "
-                       f"{_clip(str(sent_error), 300)})", key),
+                       f"{_clip(redact(str(sent_error), key), 300)})", key),
                 status=spend.answered_status, attempts=spend.sent, raw={"error_type": type(sent_error).__name__})
         if isinstance(error, ModelCallError):
             _scrub_error(error, key)
@@ -1027,14 +1116,15 @@ def chat(model_key: str, messages: list[dict] | str, images: list | None = None,
     failure: BaseException | None = None
     usd, usd_source, notes, known = float(projected), "computed", [], False
     try:
-        notes = clean_token_counts(result)  # 10**400 tokens is not a count: dropped, with a note
-        usd, usd_source, cost_notes = settled_cost(result, entry, cfg, projected, est_in, max_out)
+        notes = clean_token_counts(result)  # 10**400, -5 or "600" tokens is not a count: dropped, with a note
+        usd, usd_source, cost_notes = settled_cost(result, entry, cfg, projected, est_in, max_out,
+                                                   dropped=bool(notes))
+        known = cost_known(result) or bool(notes)  # a dropped count without a usable cost settles at the projection
         notes = notes + cost_notes
-        known = cost_known(result)
     except Exception as exc:  # noqa: BLE001 - the cost is unknown: the reservation stays counted at the projection
         usd, usd_source, known = float(projected), "computed", False
-        notes = notes + [f"the cost could not be computed ({type(exc).__name__}: {_clip(str(exc))}), so the call "
-                         "stays counted at its projection"]
+        notes = notes + [f"the cost could not be computed ({type(exc).__name__}: "
+                         f"{_clip(redact(str(exc), key, media=False))}), so the call stays counted at its projection"]
     except BaseException as exc:  # noqa: BLE001 - an interrupt: re-raised once the event is written
         failure = exc
     note = redact("; ".join(notes), key, media=False) if notes else None
@@ -1077,7 +1167,9 @@ def chat(model_key: str, messages: list[dict] | str, images: list | None = None,
             json_value = strip_secret(result.json_value, key)
             if result.json_value is not None:  # an answer returned as data (Jev): its text is the scrubbed value's
                 text = _answer_text(json_value, text)
-            value, json_error = _json_result(text, json_value, schema_d)
+            # parsing decodes any other spelling of the key: it is cut from the parsed value and json_error too, and
+            # an answer whose value held it is kept as json.dumps of the scrubbed value
+            text, value, json_error = _fresh_json(text, json_value, schema_d, key)
             response = Response(
                 text=text, json=value, json_error=json_error, model_key=model_key, provider=adapter.name,
                 model=model_name, role=role, input_tokens=result.input_tokens, output_tokens=result.output_tokens,

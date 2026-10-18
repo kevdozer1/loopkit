@@ -43,6 +43,8 @@ REJECTED_BEFORE_GENERATION = tuple(sorted(_REJECTED))
 _UNSENT_OUTCOMES = ("rejected", "not_sent")
 #: a token count this large is not a count (the router treats it as not reported)
 MAX_TOKEN_COUNT = 10 ** 12
+#: the highest TCP port; httpx parses a larger one and the OS resolver wraps it
+MAX_PORT = 65535
 # a host name as it goes on the wire (IDNA already applied) or an IPv4 address
 _HOST_RE = re.compile(r"[A-Za-z0-9._-]+")
 
@@ -84,11 +86,18 @@ class AdapterRequest:
 
 @dataclass
 class AdapterResult:
+    """One answered call. The token counts are as the provider reported them (None: not reported).
+
+    An adapter does not check them: chat() treats a value that is not a token count (a
+    negative or fractional number, a string, NaN, ``10**400``...) as not reported and says
+    so in the call's cost note, so a garbled count never goes missing silently.
+    """
+
     text: str
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    reasoning_tokens: int | None = None
-    cached_tokens: int | None = None
+    input_tokens: Any = None
+    output_tokens: Any = None
+    reasoning_tokens: Any = None
+    cached_tokens: Any = None
     usd: float | None = None  # provider-reported cost; None means compute it from tokens
     model_returned: str | None = None
     finish_reason: str | None = None
@@ -150,7 +159,9 @@ def check_url(entry: "ModelEntry", field_name: str, url: str | None, sent: str |
     trailing whitespace (a YAML ``|`` or ``>`` block scalar leaves a trailing
     newline), any space and any control character are refused. The URL that will be
     sent must be one httpx parses, http or https, with a host a server can answer to
-    (httpx accepts ``https://[api.x/v1`` and sends it to the host ``%5Bapi.x``).
+    (httpx accepts ``https://[api.x/v1`` and sends it to the host ``%5Bapi.x``) and a
+    port from 1 to 65535 (httpx accepts ``:99999``, and the resolver wraps it to
+    another port, where the request and its key would go).
     """
     import httpx
 
@@ -177,15 +188,18 @@ def check_url(entry: "ModelEntry", field_name: str, url: str | None, sent: str |
                 problem = "is not an http(s) URL with a host"
             elif not _host_ok(parsed.raw_host):
                 problem = f"is not a valid URL (its host {parsed.host!r} is not a host name or an IP address)"
+            elif parsed.port is not None and not 1 <= parsed.port <= MAX_PORT:
+                problem = f"is not a valid URL (its port {parsed.port} is not from 1 to {MAX_PORT})"
     if problem:
         raise ModelNotConfigured(f"model {entry.key!r}: {field_name} {text!r} in config/models.yaml {problem}")
 
 
 def as_int(value: Any) -> int | None:
-    """A token count from a provider response, or None (negative or non-integral counts are not counts).
+    """A whole non-negative number as an int, or None (negative or non-integral numbers are not counts).
 
-    An absurdly large count is returned as it is, so the router can say so: chat()
-    treats a count of :data:`MAX_TOKEN_COUNT` or more as not reported, with a note.
+    Not for the token counts an adapter returns: those go to chat() as reported (see
+    :class:`AdapterResult`), so a value that is not a count is dropped with a note
+    naming it rather than silently, as it would be here.
     """
     if isinstance(value, bool) or value is None:
         return None
