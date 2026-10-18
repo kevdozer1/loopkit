@@ -627,6 +627,20 @@ def _rebuilt_text(value: Any) -> str:
         return ""
 
 
+def _without_answer(raw: dict[str, Any]) -> dict[str, Any]:
+    """``raw`` with the provider's body left out: the router's own notes and the numeric usage counts only.
+
+    For an answer that held the key in a spelling parsing decodes: the body keeps the answer as
+    written, so anyone parsing ``raw`` (or a cache hit's ``raw``) would get the key back.
+    """
+    kept = {k: raw[k] for k in ("usd_note", "route_note", "price_fallback", "reasoning_budget_projected") if k in raw}
+    usage = raw.get("usage")
+    if isinstance(usage, dict):
+        kept["usage"] = {k: v for k, v in usage.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    kept["provider_body"] = "left out: the answer held the API key in an escaped spelling"
+    return kept
+
+
 def _fresh_json(text: str, json_value: Any, json_schema: dict[str, Any] | None,
                 key: str) -> tuple[str, Any, str | None]:
     """(text, value, json_error) for an answer just received, with the key in none of them. Never raises.
@@ -640,7 +654,13 @@ def _fresh_json(text: str, json_value: Any, json_schema: dict[str, Any] | None,
     value, so neither the Response nor the cache keeps a spelling that a later parse
     (every cache hit) would decode again.
     """
-    if json_schema is None:
+    if json_schema is None:  # no schema, so no value to return, but a parse could still decode the key later
+        try:
+            parsed, error = parse_json_text(text)
+            if error is None and cut_secret(parsed, key)[1]:
+                return _rebuilt_text(cut_secret(parsed, key)[0]), json_value, None
+        except Exception:  # noqa: BLE001 - never raise after a paid call
+            pass
         return text, json_value, None
     try:
         value, error = parse_json_text(text)
@@ -1169,7 +1189,13 @@ def chat(model_key: str, messages: list[dict] | str, images: list | None = None,
                 text = _answer_text(json_value, text)
             # parsing decodes any other spelling of the key: it is cut from the parsed value and json_error too, and
             # an answer whose value held it is kept as json.dumps of the scrubbed value
+            as_written = text
             text, value, json_error = _fresh_json(text, json_value, schema_d, key)
+            if text != as_written:  # the provider body carries the answer as written, that spelling included
+                ours = {k: raw[k] for k in ("unreconciled_attempts", "unreconciled_reserved_usd", "ledger_usd")
+                        if k in raw}
+                raw = {**_without_answer(raw), **ours}
+                cached_raw = _without_answer(cached_raw)
             response = Response(
                 text=text, json=value, json_error=json_error, model_key=model_key, provider=adapter.name,
                 model=model_name, role=role, input_tokens=result.input_tokens, output_tokens=result.output_tokens,

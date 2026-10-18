@@ -171,6 +171,15 @@ def test_writer_sends_validator_errors_back():
     assert "does not validate" in seen[1] and "bad_json" in seen[1]
 
 
+def test_writer_finds_the_graph_after_json_in_prose():
+    task = task_spec("T2")
+    graph = json.dumps(reference_graph("T2"))
+    for prose in ("Use {} for a skill with no params. ", 'I used {"ref": "find_box.pose"} for the pose. '):
+        with fake_script([prose + graph]):
+            res = write_graph("fake", task, catalog(), None)
+        assert res.ok and res.attempts == 1, (prose, res.errors)
+
+
 def test_writer_gives_up_after_three_repairs():
     task = task_spec("T2")
     with fake_script(["nope"] * 4):

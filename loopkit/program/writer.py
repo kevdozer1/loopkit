@@ -80,7 +80,10 @@ def write_graph(model_key: str, task: TaskSpec, catalog: dict[str, SkillSpec], i
                                        bool(getattr(resp, "cache_hit", False)), True))
         text = getattr(resp, "text", "") or ""
         result.last_text = text
-        source: Any = resp.json if isinstance(getattr(resp, "json", None), dict) else text
+        parsed = getattr(resp, "json", None)
+        # the router parses the first JSON object in the answer; when that is not a graph (an example in prose
+        # before it), the validator searches the text itself
+        source: Any = parsed if isinstance(parsed, dict) and "nodes" in parsed else (text or parsed)
         errors = validate_graph(source, catalog, task)
         if not errors:
             graph, _ = parse_graph(source)

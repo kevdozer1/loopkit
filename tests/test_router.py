@@ -1856,6 +1856,44 @@ def test_h2_a_key_in_another_json_escape_is_cut_from_the_parsed_answer(ask, cach
     assert r.text == "" and r.json == {"green": "[redacted]"} and not cache.path_for(r.request_hash).exists()
 
 
+def _decodes_to_key(key: str, value) -> bool:
+    """True when ``value``, or any string inside it parsed as JSON, gives ``key`` back."""
+    if isinstance(value, dict):
+        return any(_decodes_to_key(key, k) or _decodes_to_key(key, v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_decodes_to_key(key, v) for v in value)
+    if isinstance(value, str):
+        if key in value:
+            return True
+        try:
+            inner = json.loads(value)
+        except (ValueError, RecursionError):
+            return False
+        return not isinstance(inner, str) and _decodes_to_key(key, inner)
+    return False
+
+
+def test_h2b_the_provider_body_is_left_out_when_the_answer_held_the_key(ask, cache, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
+    content = '{"green": 5, "echo": "' + _u_escaped(PLAIN_KEY, 4) + '"}'
+    r = ask("orm", "escaped in the body", json_schema=GREEN_SCHEMA,
+            http=Server((200, or_response(content=content))).client())
+    record = json.loads(cache.path_for(r.request_hash).read_text(encoding="utf-8"))
+    for where in (r.raw, record, r.text, r.json):
+        assert not _decodes_to_key(PLAIN_KEY, where)
+    assert "choices" not in r.raw and r.raw["provider_body"].startswith("left out")
+    assert "choices" not in record["raw"] and r.raw["ledger_usd"] >= 0
+    hit = ask("orm", "escaped in the body", json_schema=GREEN_SCHEMA)
+    assert hit.cache_hit and not _decodes_to_key(PLAIN_KEY, hit.raw)
+    # without a schema there is no parsed value to return, but the text must not decode to the key either
+    r2 = ask("orm", "escaped, no schema", http=Server((200, or_response(content=content))).client())
+    assert not _decodes_to_key(PLAIN_KEY, r2.text) and not _decodes_to_key(PLAIN_KEY, r2.raw)
+    # an answer without the key keeps its provider body
+    r3 = ask("orm", "no key", json_schema=GREEN_SCHEMA,
+             http=Server((200, or_response(content='{"green": 5}'))).client())
+    assert "provider_body" not in r3.raw and r3.text == '{"green": 5}'
+
+
 # --------------------------------------------------------------------------- H3: redact, then cut to length
 def test_h3_error_text_is_redacted_before_it_is_cut_to_length(ask, ledger, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", PLAIN_KEY)
