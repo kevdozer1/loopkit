@@ -146,13 +146,14 @@ def summarize(out: Path, snapshot: dict | None = None) -> dict[str, Any]:
     for unit, g in rounds.groupby("unit"):
         rates = g.groupby("round")["passed"].mean()
         best_round[unit] = int(rates[rates == rates.max()].index.min())
-    # the reasoning setting each model's writer calls actually sent (docs/03 rule 1)
+    # the reasoning setting each model's calls actually sent, per role (docs/03 rule 1)
     reasoning: dict[str, set[str]] = {}
     unit_model = dict(zip(units["run_id"].astype(str), _col(units, "meta_model_key")))
-    for _, c in calls[calls["role"] == "writer"].iterrows():
+    for _, c in calls.iterrows():
         model = unit_model.get(c["unit"]) or c.get("model_key")
         setting = c.get("reasoning_setting")
-        reasoning.setdefault(str(model), set()).add(setting if isinstance(setting, str) else json.dumps(setting))
+        text = setting if isinstance(setting, str) else json.dumps(setting)
+        reasoning.setdefault(f"{model} {c.get('role')}", set()).add(text)
     rows = []
     for (model, task), h in held.groupby(["model", "task"], sort=True):
         n, k = len(h), int(h["passed"].sum())
@@ -295,8 +296,9 @@ def render_markdown(out: Path, s: dict[str, Any], snapshot: dict[str, Any], unit
     lines += ["## Run facts", "",
               "- Model ids: " + (", ".join(f"{k} = {v.get('id')} via {v.get('adapter')}" for k, v in models.items())
                                  or "none recorded"),
-              "- Writer reasoning sent: " + ("; ".join(f"{m}: {', '.join(v)}" for m, v in sorted(s["reasoning"].items()))
-                                             or "no writer calls"),
+              "- Reasoning setting sent, per model and role: " + ("; ".join(f"{m}: {', '.join(v)}"
+                                                                         for m, v in sorted(s["reasoning"].items()))
+                                                               or "no model calls"),
               f"- Run date {date}, git commit {snapshot.get('git_commit')}",
               f"- Cache policy: {snapshot.get('cache_policy')}",
               _seeds_line(snapshot, bo),

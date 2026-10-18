@@ -129,7 +129,7 @@ def test_report_numbers_come_from_the_traces(tmp_path):
     assert "Stopped at a cap: beta" in md
     assert "gamma__T2__r1: skipped_no_key (no key: set OPENROUTER_API_KEY)" in md
     assert "| T2 | alpha | 32/40 | 80% |" in md
-    assert 'alpha: {"effort":"high"}' in md
+    assert 'alpha writer: {"effort":"high"}' in md
     res = pd.read_parquet(paths_out["results"])
     assert len(res) == 64 and set(res["model"]) == {"alpha", "beta"}
     assert (out / "pass_vs_cost.png").stat().st_size > 10_000

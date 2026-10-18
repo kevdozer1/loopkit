@@ -116,10 +116,13 @@ def read_panel(ctx: SkillContext) -> PanelReport:
     question = ("Report every port 1 to 12 as JSON: {\"1\": {\"occupied\": true|false, \"led\": \"green|amber|red|off\"}, "
                 "..., \"12\": {...}}. Read the port numbers from the label strip.")
     ctx.images["read_panel_front"] = image
+    kwargs = dict(ctx.chat_kwargs)  # the run's reader settings (bakeoff.yaml reader:) win over these defaults
+    max_tokens = int(kwargs.pop("max_tokens", 1500))
+    reasoning = kwargs.pop("reasoning", "disabled")
     resp = ctx.chat(ctx.reader_model, [{"role": "system", "content": READER_SYSTEM},
                                        {"role": "user", "content": question}],
-                    images=[image], json_schema=schema, role="reader", max_tokens=1500, reasoning="disabled",
-                    schema_name="panel_report", **ctx.chat_kwargs)
+                    images=[image], json_schema=schema, role="reader", max_tokens=max_tokens, reasoning=reasoning,
+                    schema_name="panel_report", **kwargs)
     ctx.model_calls += 1
     ctx.model_usd += float(getattr(resp, "usd", 0.0) or 0.0)
     data = getattr(resp, "json", None)

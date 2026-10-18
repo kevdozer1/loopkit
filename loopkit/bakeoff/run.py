@@ -179,7 +179,9 @@ def run_unit(out: Path, model: str, task: str, repeat: int, cfg: BakeoffConfig, 
         if task == T1_GRAPH:
             graph = ProgramGraph.model_validate(reference_graph("T1"))
             results = score_heldout(out, task, graph, heldout, workers=workers, unit=unit, reader_model=route,
-                                    reader_tag=f"{model}_r{repeat}", chat_kwargs={"cache_salt": salt}, trace=trace)
+                                    reader_tag=f"{model}_r{repeat}", trace=trace,
+                                    chat_kwargs={"cache_salt": salt, "max_tokens": cfg.reader.max_tokens,
+                                                 "reasoning": cfg.reader.reasoning})
             record.update(status="done", heldout=results, rehearsal=None, graph_hash=graph.graph_hash())
         else:
             spec = task_spec(task)
