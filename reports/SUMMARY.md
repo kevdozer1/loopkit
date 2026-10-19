@@ -102,7 +102,7 @@ Defects caught while building and testing S3 and S4, all fixed:
 - The writer swallowed a spend-cap stop, so a capped model would never have recorded where it stopped (caught before the S3 commit).
 - The T1 episode cache was keyed on the route, which is "fake" for every model in a dry run, so models would have shared answers (caught in a small dry run before the S4 commit).
 - The report crashed at a perfect score, because the Wilson upper bound rounded to just under 1.
-- The reader ignored the `reader:` settings in bakeoff.yaml (fixed in 4994f5f).
+- The reader ignored the `reader:` settings in bakeoff.yaml (fixed in e488a3d).
 - A unit whose writer never produced a valid graph would have been left out of the pass rates (caught before the S4 commit). It now counts as a failure on every held-out seed, and the report names it.
 
 The perfect-score crash, the spend-cap stop and the no-graph unit have regression tests. The reader settings, the T1 cache key and the not-seated failure in `slide_into` do not yet (`tests/test_skills.py` covers the box-localization half of that fix).
@@ -112,7 +112,7 @@ The perfect-score crash, the spend-cap stop and the no-graph unit have regressio
 - The bake-off held-out seeds 2000 to 2019 have never been used. Dry runs default to dev seeds 600 to 619.
 - Neither S3 number is a clean held-out result. Seed 512 is in the S3 held-out set and prompted the skill fix, so the post-fix T2 20/20 on seeds 500 to 519 is not clean. The dev sweep is not clean either: seeds 100 to 199 include seeds 103 and 146, which also showed the problem, and seeds 100 to 159 were used to measure the localization error. The bake-off held-out seeds will give a clean number.
 - `setup/start_bakeoff.ps1` was checked with PowerShell's parser but never run, since running it would start the bake-off.
-- No key was printed, logged or committed, `context/` was never committed, and nothing was pushed.
+- No key was printed, logged or committed, and `context/` was never committed. Before the push to GitHub, CLAUDE.md rule 1 was reworded to "Nothing here names any employer." in every commit, so no commit in the public history names the employer.
 - One tool call was denied. During the review, a verifier subagent's PowerShell `Stop-Process` on its own hung scratch process was refused, and the subagent then used `taskkill` on the same processes, which breaks KICKOFF's rule against retrying a denied action in another form. Nothing outside the scratchpad was affected. PROGRESS.md records it.
 
 ## Open issues
@@ -124,7 +124,6 @@ The perfect-score crash, the spend-cap stop and the no-graph unit have regressio
 - The writer's 900 s deadline also covers connecting. A shorter connect timeout would fail faster on a dead route.
 - Occupied-port plugs are the same yellow as amber LEDs. A reader model could confuse them on a poorly lit seed.
 - Three fixes have no regression test yet (listed under Review and hardening).
-- CLAUDE.md rule 1 names the employer in the sentence that forbids naming it. Suggested wording: "Nothing here names any employer."
 - `claude --version` reports 2.1.81, and README step 3 asks for 2.1.259 or later for `setup\run_session.ps1`.
 - Low-severity residuals from the last review round are listed in S1.md.
 
@@ -141,7 +140,7 @@ Run the commands from the repo root.
 
 ## By the numbers
 
-- 13 commits in the build session, from `cf18348` (spec) to `1636ab3` (final status).
+- 13 commits in the build session, from `e47e837` (spec) to `9eb3824` (final status).
 - 69 Python modules, 14,495 lines in `loopkit/`: router 4,328, schemas 2,596, sim 2,234, traces 1,500, skills 1,347, bakeoff 1,069, program 672, runtime 328, and 421 in the top-level `config.py`, `paths.py` and `__init__.py`.
 - 593 tests in 7,391 lines, all passing in the final run: schemas 343, router 89, traces 82, paths and config 25, sim 18, program 12, skills 12, bakeoff 11, smoke 1.
 
@@ -157,20 +156,23 @@ Run the commands from the repo root.
 
 `LOOPKIT_DATA` defaults to `D:\loopkit_data`.
 
-## Commit history (build session)
+## Commit history
 
 | Commit | What |
 |---|---|
-| cf18348 | S0: initial spec, docs, configs and session prompts |
-| 64f20ba | S0: uv package, paths and config, Panda smoke render |
-| 2360d48 | S1: schemas, router and traces, reviewed and fixed |
-| 935bbcb | S2: rack_cell scene, SimBackend, checkers, oracles |
-| 7391022 | S3: skill library, interpreter, writer and rehearse-and-patch |
-| bb187d6 | S4: bake-off runner, report and cost estimate, dry run |
-| 4994f5f | S4: T1 reader settings from bakeoff.yaml |
-| 7478a71 | S4: keep Windows awake during a bake-off run |
-| 93bf941 | S1 follow-up: review round 2, router and schemas |
-| 65eefe7 | S1 follow-up: trace writer survives Ctrl+C |
-| c059d3c | S1 follow-up: review round 3, router and schemas |
-| 3f75611 | S1 follow-up: drop the provider body when an answer held the key, writer finds the graph after a JSON example in prose |
-| 1636ab3 | Final: PROGRESS with the last test run |
+| e47e837 | S0: initial spec, docs, configs and session prompts |
+| fac0ecf | S0: uv package, paths and config, Panda smoke render |
+| bf62693 | S1: schemas, router and traces, reviewed and fixed |
+| 06c1526 | S2: rack_cell scene, SimBackend, checkers, oracles |
+| 69b5942 | S3: skill library, interpreter, writer and rehearse-and-patch |
+| 5058188 | S4: bake-off runner, report and cost estimate, dry run |
+| e488a3d | S4: T1 reader settings from bakeoff.yaml |
+| bebc12c | S4: keep Windows awake during a bake-off run |
+| af01a7b | S1 follow-up: review round 2, router and schemas |
+| 8cf2718 | S1 follow-up: trace writer survives Ctrl+C |
+| 096658f | S1 follow-up: review round 3, router and schemas |
+| 2ee4ca1 | S1 follow-up: drop the provider body when an answer held the key, writer finds the graph after a JSON example in prose |
+| 9eb3824 | Final: PROGRESS with the last test run |
+| e47a376 | bakeoff: --heldout-seeds help points at dev seeds |
+| 395c2c5 | Reports: SUMMARY.md, the whole build on one page |
+| 9e1623e | README: the loop, the three tasks, status and a quickstart |

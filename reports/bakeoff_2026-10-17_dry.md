@@ -98,7 +98,7 @@ Patch rounds to best graph: the earliest round whose training pass rate was the 
 
 - Model ids: opus = anthropic/claude-opus-5.5 via openrouter, astra = openai/gpt-6-astra via openrouter, sol = openai/gpt-6.1-sol via openrouter, argon = google/gemini-4-argon via openrouter, glimpse = elorian-1 via elorian, cheap_open = nex-agi/nex-n2.5-mini via openrouter
 - Reasoning setting sent, per model and role: argon reader: {"enabled":false}; argon writer: {"effort":"high"}; astra reader: {"enabled":false}; astra writer: {"effort":"high"}; cheap_open reader: {"enabled":false}; cheap_open writer: {"effort":"high"}; glimpse reader: {"enabled":false}; glimpse writer: {"effort":"high"}; opus reader: {"enabled":false}; opus writer: {"effort":"high"}; sol reader: {"enabled":false}; sol writer: {"effort":"high"}
-- Run date 2026-10-17, git commit 64f20ba
+- Run date 2026-10-17, git commit fac0ecf
 - Cache policy: router disk cache on; the repeat index is part of every writer and reader request hash, so repeats never share cache entries; held-out episode results are cached by (task, seed, graph hash) because the simulator is deterministic (T1 adds reader and repeat to the key)
 - Seeds: training 1000 to 1009 (10 seeds), held-out 600 to 619 (20 seeds), repeats 3. The seeds were overridden for this run, so it is a smoke run, not the bake-off: the config's seeds are training 1000 to 1009 and held-out 2000 to 2019
 - Built from 9312 trace events under traces/ (model_call, verdict, patch, budget_stop). Unit checkpoints are used only for the list of units without results.
